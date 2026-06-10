@@ -11,6 +11,9 @@
 
 #include "knowhere/index/index.h"
 
+#include <algorithm>
+#include <cstdint>
+
 #include "fmt/format.h"
 #include "folly/futures/Future.h"
 #include "knowhere/comp/time_recorder.h"
@@ -35,6 +38,42 @@ LoadConfig(BaseConfig* cfg, const Json& json, knowhere::PARAM_TYPE param_type, c
     RETURN_IF_ERROR(res);
     cfg->CaptureRawJson(json_);
     return Config::Load(*cfg, json_, param_type, msg);
+}
+
+inline size_t
+CountEmbListBitset(const BitsetView& bitset, const ExternalIdMap& external_id_map, const EmbListOffset* emb_list_offset,
+                   size_t internal_count) {
+    auto internal_doc_count = emb_list_offset->num_el();
+    auto count_vectors = internal_count != internal_doc_count;
+    size_t count = 0;
+
+    for (size_t internal_doc_id = 0; internal_doc_id < internal_doc_count; ++internal_doc_id) {
+        auto external_doc_id = external_id_map.ToExternalId(internal_doc_id);
+        if (!bitset.test(external_doc_id)) {
+            continue;
+        }
+        if (count_vectors) {
+            count += emb_list_offset->get_el_len(internal_doc_id);
+        } else {
+            ++count;
+        }
+    }
+    return count;
+}
+
+inline BitsetView
+EnsureBitsetCount(const BitsetView& bitset, const ExternalIdMap& external_id_map,
+                  const EmbListOffset* emb_list_offset, size_t internal_count) {
+    if (bitset.empty() || bitset.data() == nullptr) {
+        return bitset;
+    }
+    if (emb_list_offset != nullptr) {
+        return BitsetView(bitset.data(), bitset.num_bits(), internal_count,
+                          CountEmbListBitset(bitset, external_id_map, emb_list_offset, internal_count), 0);
+    }
+
+    auto count = bitset.count_filtered_bits(external_id_map.GetValidBitmapView().data);
+    return BitsetView(bitset.data(), bitset.num_bits(), internal_count, count, 0);
 }
 
 #ifdef KNOWHERE_WITH_CARDINAL
@@ -127,22 +166,15 @@ Index<T>::Search(const DataSetPtr dataset, const Json& json, const BitsetView& b
     // when index is mutable, it could happen that data count larger than bitset size, see
     // https://github.com/zilliztech/knowhere/issues/70
     // so something must be wrong at caller side when passed bitset size larger than data count
-    if (bitset_.size() > static_cast<size_t>(this->Count())) {
-        msg = fmt::format("bitset size should be <= data count, but we get bitset size: {}, data count: {}",
-                          bitset_.size(), this->Count());
+    if (bitset_.num_bits() > static_cast<size_t>(this->ExternalCount())) {
+        msg = fmt::format("bitset size should be <= external data count, but we get bitset size: {}, data count: {}",
+                          bitset_.num_bits(), this->ExternalCount());
         LOG_KNOWHERE_ERROR_ << msg;
         return expected<DataSetPtr>::Err(Status::invalid_args, msg);
     }
 
-    BitsetView bitset;
-    if (bitset_.count() == 0) {
-        // traverse bitset to get the filtered out num
-        auto filtered_out_num = bitset_.get_filtered_out_num_();
-        bitset = BitsetView(bitset_.data(), bitset_.size(), filtered_out_num);
-    } else {
-        // if bitset has filtered out num, use it
-        bitset = bitset_;
-    }
+    auto bitset =
+        EnsureBitsetCount(bitset_, this->node->GetExternalIdMap(), this->node->GetEmbListOffset(), this->node->Count());
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     const BaseConfig& b_cfg = static_cast<const BaseConfig&>(*cfg);
@@ -197,14 +229,15 @@ Index<T>::AnnIterator(const DataSetPtr dataset, const Json& json, const BitsetVi
     // when index is mutable, it could happen that data count larger than bitset size, see
     // https://github.com/zilliztech/knowhere/issues/70
     // so something must be wrong at caller side when passed bitset size larger than data count
-    if (bitset_.size() > static_cast<size_t>(this->Count())) {
-        msg = fmt::format("bitset size should be <= data count, but we get bitset size: {}, data count: {}",
-                          bitset_.size(), this->Count());
+    if (bitset_.num_bits() > static_cast<size_t>(this->ExternalCount())) {
+        msg = fmt::format("bitset size should be <= external data count, but we get bitset size: {}, data count: {}",
+                          bitset_.num_bits(), this->ExternalCount());
         LOG_KNOWHERE_ERROR_ << msg;
         return expected<std::vector<std::shared_ptr<IndexNode::iterator>>>::Err(Status::invalid_args, msg);
     }
 
-    const auto bitset = BitsetView(bitset_.data(), bitset_.size(), bitset_.get_filtered_out_num_());
+    auto bitset =
+        EnsureBitsetCount(bitset_, this->node->GetExternalIdMap(), this->node->GetEmbListOffset(), this->node->Count());
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // note that this time includes only the initial search phase of iterator.
@@ -235,14 +268,15 @@ Index<T>::RangeSearch(const DataSetPtr dataset, const Json& json, const BitsetVi
     // when index is mutable, it could happen that data count larger than bitset size, see
     // https://github.com/zilliztech/knowhere/issues/70
     // so something must be wrong at caller side when passed bitset size larger than data count
-    if (bitset_.size() > static_cast<size_t>(this->Count())) {
-        msg = fmt::format("bitset size should be <= data count, but we get bitset size: {}, data count: {}",
-                          bitset_.size(), this->Count());
+    if (bitset_.num_bits() > static_cast<size_t>(this->ExternalCount())) {
+        msg = fmt::format("bitset size should be <= external data count, but we get bitset size: {}, data count: {}",
+                          bitset_.num_bits(), this->ExternalCount());
         LOG_KNOWHERE_ERROR_ << msg;
         return expected<DataSetPtr>::Err(Status::invalid_args, msg);
     }
 
-    const auto bitset = BitsetView(bitset_.data(), bitset_.size(), bitset_.get_filtered_out_num_());
+    auto bitset =
+        EnsureBitsetCount(bitset_, this->node->GetExternalIdMap(), this->node->GetEmbListOffset(), this->node->Count());
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     const BaseConfig& b_cfg = static_cast<const BaseConfig&>(*cfg);
@@ -414,6 +448,12 @@ template <typename T>
 inline int64_t
 Index<T>::Count() const {
     return this->node->Count();
+}
+
+template <typename T>
+inline int64_t
+Index<T>::ExternalCount() const {
+    return this->node->ExternalCount();
 }
 
 template <typename T>
