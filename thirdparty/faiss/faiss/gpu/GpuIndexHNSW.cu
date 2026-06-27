@@ -24,10 +24,10 @@
 #include <faiss/IndexScalarQuantizer.h>
 #include <faiss/cppcontrib/knowhere/IndexHNSW.h>
 #include <faiss/gpu/GpuIndexHNSW.h>
+#include <faiss/gpu/impl/GpuHnswTypes.h>
 #include <faiss/gpu/utils/DeviceUtils.h>
 #include <faiss/gpu/impl/GpuHnswBuild.cuh>
 #include <faiss/gpu/impl/GpuHnswSearch.cuh>
-#include <faiss/gpu/impl/GpuHnswTypes.h>
 
 #include <cstdio>
 #include <memory>
@@ -126,8 +126,8 @@ void GpuIndexHNSW::searchImpl_(
 
     GpuHnswSearchParams sp;
     if (search_params) {
-        auto* params = dynamic_cast<const SearchParametersGpuHNSW*>(
-                search_params);
+        auto* params =
+                dynamic_cast<const SearchParametersGpuHNSW*>(search_params);
         if (params) {
             sp.ef = params->ef;
             sp.search_width = params->search_width;
@@ -145,34 +145,46 @@ void GpuIndexHNSW::searchImpl_(
     int overflow_ef = sp.overflow_factor * sp.ef;
     sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows), overflow_ef);
 
-    // H2D: query vectors
+    // D2D: query vectors (GpuIndex::search passes device pointers)
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             sc.d_queries,
             x,
             static_cast<size_t>(nq) * dim * sizeof(float),
-            cudaMemcpyHostToDevice,
+            cudaMemcpyDeviceToDevice,
             stream));
 
     gpu_hnsw_search(stream, sp, idx, nq, k);
 
     GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // D2H: results
+    // D2D: distances (output is a device pointer from GpuIndex::search)
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
+            distances,
+            sc.d_distances,
+            static_cast<size_t>(nq) * k * sizeof(float),
+            cudaMemcpyDeviceToDevice,
+            stream));
+
+    // Labels: D2H stage (uint64_t→idx_t conversion), then H2D back
     auto tmp = std::make_unique<uint64_t[]>(nq * k);
     GPU_HNSW_CUDA_CHECK(cudaMemcpy(
             tmp.get(),
             sc.d_neighbors,
             static_cast<size_t>(nq) * k * sizeof(uint64_t),
             cudaMemcpyDeviceToHost));
-    GPU_HNSW_CUDA_CHECK(cudaMemcpy(
-            distances,
-            sc.d_distances,
-            static_cast<size_t>(nq) * k * sizeof(float),
-            cudaMemcpyDeviceToHost));
 
+    auto h_labels = std::make_unique<idx_t[]>(nq * k);
     for (int i = 0; i < nq * k; i++) {
-        labels[i] = (tmp[i] == UINT64_MAX) ? -1 : static_cast<idx_t>(tmp[i]);
+        h_labels[i] = (tmp[i] == UINT64_MAX) ? -1 : static_cast<idx_t>(tmp[i]);
     }
+
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
+            labels,
+            h_labels.get(),
+            static_cast<size_t>(nq) * k * sizeof(idx_t),
+            cudaMemcpyHostToDevice,
+            stream));
+    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 } // namespace gpu
