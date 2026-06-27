@@ -639,4 +639,190 @@ TEST_CASE("Test All GPU Index", "[search]") {
         REQUIRE(recall >= 0.7f);
     }
 }
+
+TEST_CASE("Test CPU vs GPU HNSW Comparison", "[gpu_hnsw_compare]") {
+    using Catch::Approx;
+
+    int64_t nb = 10000, nq = 100;
+    int64_t dim = 128;
+    int64_t seed = 42;
+
+    auto version = GenTestVersionList();
+
+    auto run_comparison = [&](const std::string& metric, float min_recall, float max_dist_drift) {
+        CAPTURE(metric, nb, nq, dim);
+
+        knowhere::Json hnsw_json;
+        hnsw_json[knowhere::meta::DIM] = dim;
+        hnsw_json[knowhere::meta::METRIC_TYPE] = metric;
+        hnsw_json[knowhere::meta::TOPK] = 10;
+        hnsw_json[knowhere::indexparam::HNSW_M] = 16;
+        hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+        hnsw_json[knowhere::indexparam::EF] = 200;
+
+        auto train_ds = GenDataSet(nb, dim, seed);
+        auto query_ds = GenDataSet(nq, dim, seed + 2);
+
+        // --- Build CPU HNSW ---
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        auto res = cpu_idx.Build(train_ds, hnsw_json);
+        REQUIRE(res == knowhere::Status::success);
+
+        // Serialize for GPU deserialization
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        // --- CPU Search with timing ---
+        auto cpu_start = std::chrono::high_resolution_clock::now();
+        auto cpu_results = cpu_idx.Search(query_ds, hnsw_json, nullptr);
+        auto cpu_end = std::chrono::high_resolution_clock::now();
+        REQUIRE(cpu_results.has_value());
+        double cpu_ms = std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count();
+
+        // --- Build GPU HNSW from serialized CPU index ---
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        auto deser_res = gpu_idx.Deserialize(bs);
+        REQUIRE(deser_res == knowhere::Status::success);
+
+        // Warm-up search (first GPU call has kernel launch overhead)
+        auto warmup = gpu_idx.Search(query_ds, hnsw_json, nullptr);
+        REQUIRE(warmup.has_value());
+
+        // --- GPU Search with timing ---
+        auto gpu_start = std::chrono::high_resolution_clock::now();
+        auto gpu_results = gpu_idx.Search(query_ds, hnsw_json, nullptr);
+        auto gpu_end = std::chrono::high_resolution_clock::now();
+        REQUIRE(gpu_results.has_value());
+        double gpu_ms = std::chrono::duration<double, std::milli>(gpu_end - gpu_start).count();
+
+        // --- Brute force ground truth ---
+        auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, hnsw_json, nullptr);
+        REQUIRE(gt.has_value());
+
+        // --- Recall comparison ---
+        float cpu_recall = GetKNNRecall(*gt.value(), *cpu_results.value());
+        float gpu_recall = GetKNNRecall(*gt.value(), *gpu_results.value());
+
+        // --- Distance accuracy: compare GPU distances against CPU distances ---
+        auto cpu_dist = cpu_results.value()->GetDistance();
+        auto gpu_dist = gpu_results.value()->GetDistance();
+        auto k = hnsw_json[knowhere::meta::TOPK].get<int64_t>();
+
+        double total_rel_error = 0.0;
+        int valid_pairs = 0;
+        for (int64_t i = 0; i < nq * k; ++i) {
+            if (std::abs(cpu_dist[i]) > 1e-6f) {
+                total_rel_error += std::abs((gpu_dist[i] - cpu_dist[i]) / cpu_dist[i]);
+                valid_pairs++;
+            }
+        }
+        double avg_rel_dist_error = (valid_pairs > 0) ? (total_rel_error / valid_pairs) : 0.0;
+
+        // --- ID overlap: how many of the same results are returned ---
+        auto cpu_ids = cpu_results.value()->GetIds();
+        auto gpu_ids = gpu_results.value()->GetIds();
+        int id_overlap = 0;
+        for (int64_t q = 0; q < nq; ++q) {
+            std::set<int64_t> cpu_set(cpu_ids + q * k, cpu_ids + (q + 1) * k);
+            for (int64_t j = 0; j < k; ++j) {
+                if (cpu_set.count(gpu_ids[q * k + j])) {
+                    id_overlap++;
+                }
+            }
+        }
+        float id_overlap_ratio = static_cast<float>(id_overlap) / (nq * k);
+
+        // --- Print comparison report ---
+        fprintf(stderr, "\n=== CPU vs GPU HNSW Comparison (%s, nb=%ld, nq=%ld, dim=%ld, k=%ld) ===\n", metric.c_str(),
+                (long)nb, (long)nq, (long)dim, (long)k);
+        fprintf(stderr, "  CPU recall@%ld: %.4f\n", (long)k, cpu_recall);
+        fprintf(stderr, "  GPU recall@%ld: %.4f\n", (long)k, gpu_recall);
+        fprintf(stderr, "  Recall delta (GPU - CPU): %+.4f\n", gpu_recall - cpu_recall);
+        fprintf(stderr, "  CPU search time: %.2f ms\n", cpu_ms);
+        fprintf(stderr, "  GPU search time: %.2f ms (includes H2D/D2H transfers)\n", gpu_ms);
+        fprintf(stderr, "  Speedup: %.2fx\n", cpu_ms / gpu_ms);
+        fprintf(stderr, "  Avg relative distance error: %.6f\n", avg_rel_dist_error);
+        fprintf(stderr, "  ID overlap (CPU vs GPU): %.4f (%d/%ld)\n", id_overlap_ratio, id_overlap, (long)(nq * k));
+        fprintf(stderr, "===\n\n");
+
+        // --- Assertions ---
+        // GPU recall should be close to CPU recall (within a small tolerance)
+        REQUIRE(gpu_recall >= min_recall);
+        // GPU should return at least 80% of the same IDs as CPU
+        REQUIRE(id_overlap_ratio >= 0.8f);
+        // Average relative distance error should be small
+        REQUIRE(avg_rel_dist_error <= max_dist_drift);
+    };
+
+    SECTION("L2 metric comparison") {
+        run_comparison(knowhere::metric::L2, 0.85f, 0.05);
+    }
+
+    SECTION("IP metric comparison") {
+        run_comparison(knowhere::metric::IP, 0.85f, 0.05);
+    }
+
+    SECTION("COSINE metric comparison") {
+        run_comparison(knowhere::metric::COSINE, 0.60f, 0.10);
+    }
+
+    SECTION("Varying ef comparison") {
+        knowhere::Json hnsw_json;
+        hnsw_json[knowhere::meta::DIM] = dim;
+        hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+        hnsw_json[knowhere::meta::TOPK] = 10;
+        hnsw_json[knowhere::indexparam::HNSW_M] = 16;
+        hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+
+        auto train_ds = GenDataSet(nb, dim, seed);
+        auto query_ds = GenDataSet(nq, dim, seed + 2);
+
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        auto res = cpu_idx.Build(train_ds, hnsw_json);
+        REQUIRE(res == knowhere::Status::success);
+
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        auto deser_res = gpu_idx.Deserialize(bs);
+        REQUIRE(deser_res == knowhere::Status::success);
+
+        auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, hnsw_json, nullptr);
+        REQUIRE(gt.has_value());
+
+        fprintf(stderr, "\n=== ef sweep (L2, nb=%ld, nq=%ld, k=10) ===\n", (long)nb, (long)nq);
+        fprintf(stderr, "  %6s  %10s  %10s  %10s  %10s\n", "ef", "cpu_recall", "gpu_recall", "cpu_ms", "gpu_ms");
+
+        for (int ef : {16, 32, 64, 128, 256, 512}) {
+            hnsw_json[knowhere::indexparam::EF] = ef;
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            auto cpu_res = cpu_idx.Search(query_ds, hnsw_json, nullptr);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto gpu_res = gpu_idx.Search(query_ds, hnsw_json, nullptr);
+            auto t2 = std::chrono::high_resolution_clock::now();
+
+            REQUIRE(cpu_res.has_value());
+            REQUIRE(gpu_res.has_value());
+
+            float cpu_recall = GetKNNRecall(*gt.value(), *cpu_res.value());
+            float gpu_recall = GetKNNRecall(*gt.value(), *gpu_res.value());
+            double cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            double gpu_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+
+            fprintf(stderr, "  %6d  %10.4f  %10.4f  %10.2f  %10.2f\n", ef, cpu_recall, gpu_recall, cpu_ms, gpu_ms);
+
+            // GPU recall should be reasonable at all ef values
+            REQUIRE(gpu_recall >= 0.5f);
+        }
+        fprintf(stderr, "===\n\n");
+    }
+}
 #endif
