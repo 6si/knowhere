@@ -23,8 +23,26 @@
 
 #include <faiss/gpu/impl/GpuHnswTypes.h>
 
+#include <stdexcept>
+#include <string>
+
 namespace faiss {
 namespace gpu {
+
+namespace {
+
+inline void check_cuda(cudaError_t err, const char* file, int line) {
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+                std::string("CUDA error in scratch alloc: ") +
+                cudaGetErrorString(err) + " at " + file + ":" +
+                std::to_string(line));
+    }
+}
+
+#define SCRATCH_CUDA_CHECK(expr) check_cuda((expr), __FILE__, __LINE__)
+
+} // namespace
 
 void GpuHnswSearchScratch::ensure(
         int nq,
@@ -36,29 +54,29 @@ void GpuHnswSearchScratch::ensure(
     if (need_q > queries_bytes) {
         if (d_queries)
             cudaFree(d_queries);
-        cudaMalloc(&d_queries, need_q);
+        SCRATCH_CUDA_CHECK(cudaMalloc(&d_queries, need_q));
         queries_bytes = need_q;
     }
     size_t need_n = static_cast<size_t>(nq) * k * sizeof(uint64_t);
     if (need_n > neighbors_bytes) {
         if (d_neighbors)
             cudaFree(d_neighbors);
-        cudaMalloc(&d_neighbors, need_n);
+        SCRATCH_CUDA_CHECK(cudaMalloc(&d_neighbors, need_n));
         neighbors_bytes = need_n;
     }
     size_t need_d = static_cast<size_t>(nq) * k * sizeof(float);
     if (need_d > distances_bytes) {
         if (d_distances)
             cudaFree(d_distances);
-        cudaMalloc(&d_distances, need_d);
+        SCRATCH_CUDA_CHECK(cudaMalloc(&d_distances, need_d));
         distances_bytes = need_d;
     }
     if (nq > entry_cap) {
         if (d_entry_points)
             cudaFree(d_entry_points);
-        cudaMalloc(
+        SCRATCH_CUDA_CHECK(cudaMalloc(
                 &d_entry_points,
-                static_cast<size_t>(nq) * sizeof(uint32_t));
+                static_cast<size_t>(nq) * sizeof(uint32_t)));
         entry_cap = nq;
     }
     int bitmap_words = (N + 31) / 32;
@@ -67,12 +85,13 @@ void GpuHnswSearchScratch::ensure(
     if (need_bm > bitmap_bytes) {
         if (d_visited_bitmaps)
             cudaFree(d_visited_bitmaps);
-        cudaMalloc(&d_visited_bitmaps, need_bm);
+        SCRATCH_CUDA_CHECK(cudaMalloc(&d_visited_bitmaps, need_bm));
         bitmap_bytes = need_bm;
     }
     size_t ovf_entries = static_cast<size_t>(nq) * overflow_ef;
     size_t need_ovf =
-            ovf_entries * (sizeof(uint32_t) + sizeof(float) + sizeof(uint32_t)) +
+            ovf_entries *
+                    (sizeof(uint32_t) + sizeof(float) + sizeof(uint32_t)) +
             static_cast<size_t>(nq) * sizeof(int);
     if (need_ovf > overflow_bytes) {
         if (d_overflow_ids)
@@ -83,12 +102,15 @@ void GpuHnswSearchScratch::ensure(
             cudaFree(d_overflow_expanded);
         if (d_overflow_count)
             cudaFree(d_overflow_count);
-        cudaMalloc(&d_overflow_ids, ovf_entries * sizeof(uint32_t));
-        cudaMalloc(&d_overflow_dists, ovf_entries * sizeof(float));
-        cudaMalloc(&d_overflow_expanded, ovf_entries * sizeof(uint32_t));
-        cudaMalloc(
+        SCRATCH_CUDA_CHECK(
+                cudaMalloc(&d_overflow_ids, ovf_entries * sizeof(uint32_t)));
+        SCRATCH_CUDA_CHECK(
+                cudaMalloc(&d_overflow_dists, ovf_entries * sizeof(float)));
+        SCRATCH_CUDA_CHECK(cudaMalloc(
+                &d_overflow_expanded, ovf_entries * sizeof(uint32_t)));
+        SCRATCH_CUDA_CHECK(cudaMalloc(
                 &d_overflow_count,
-                static_cast<size_t>(nq) * sizeof(int));
+                static_cast<size_t>(nq) * sizeof(int)));
         overflow_bytes = need_ovf;
     }
 }
@@ -129,8 +151,6 @@ GpuHnswDeviceIndex::~GpuHnswDeviceIndex() {
     }
     if (d_upper_layer_ptrs)
         cudaFree(d_upper_layer_ptrs);
-    if (search_stream)
-        cudaStreamDestroy(search_stream);
 }
 
 } // namespace gpu
