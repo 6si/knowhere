@@ -443,5 +443,200 @@ TEST_CASE("Test All GPU Index", "[search]") {
             CHECK(GetRelativeLoss(gt_dist[i], dist[i]) < 0.1f);
         }
     }
+
+    // GPU_HNSW tests: build on CPU as HNSW, serialize, deserialize as GPU_HNSW, search on GPU.
+    SECTION("Test GPU HNSW Search (CPU build -> GPU search)") {
+        // Build a CPU HNSW index
+        knowhere::Json hnsw_json;
+        hnsw_json[knowhere::meta::DIM] = dim;
+        hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+        hnsw_json[knowhere::meta::TOPK] = 1;
+        hnsw_json[knowhere::indexparam::HNSW_M] = 16;
+        hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+        hnsw_json[knowhere::indexparam::EF] = 200;
+
+        auto train_ds = GenDataSet(nb, dim, seed);
+        auto query_ds = GenDataSet(nq, dim, seed + 2);
+
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        auto res = cpu_idx.Build(train_ds, hnsw_json);
+        REQUIRE(res == knowhere::Status::success);
+
+        // Serialize the CPU index
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        // Deserialize as GPU_HNSW
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        auto deser_res = gpu_idx.Deserialize(bs);
+        REQUIRE(deser_res == knowhere::Status::success);
+
+        // Search on GPU
+        auto results = gpu_idx.Search(query_ds, hnsw_json, nullptr);
+        REQUIRE(results.has_value());
+
+        // Compare against brute force
+        auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, hnsw_json, nullptr);
+        REQUIRE(gt.has_value());
+        float recall = GetKNNRecall(*gt.value(), *results.value());
+        REQUIRE(recall >= 0.9f);
+    }
+
+    SECTION("Test GPU HNSW Search Cosine Metric") {
+        knowhere::Json hnsw_json;
+        hnsw_json[knowhere::meta::DIM] = dim;
+        hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::COSINE;
+        hnsw_json[knowhere::meta::TOPK] = 1;
+        hnsw_json[knowhere::indexparam::HNSW_M] = 16;
+        hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+        hnsw_json[knowhere::indexparam::EF] = 200;
+
+        auto train_ds = GenDataSet(nb, dim, seed);
+        auto query_ds = GenDataSet(nq, dim, seed + 1);
+
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        auto res = cpu_idx.Build(train_ds, hnsw_json);
+        REQUIRE(res == knowhere::Status::success);
+
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        auto deser_res = gpu_idx.Deserialize(bs);
+        REQUIRE(deser_res == knowhere::Status::success);
+
+        auto results = gpu_idx.Search(query_ds, hnsw_json, nullptr);
+        REQUIRE(results.has_value());
+
+        auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, hnsw_json, nullptr);
+        REQUIRE(gt.has_value());
+        float recall = GetKNNRecall(*gt.value(), *results.value());
+        REQUIRE(recall >= 0.65f);
+    }
+
+    SECTION("Test GPU HNSW Search TopK") {
+        knowhere::Json hnsw_json;
+        hnsw_json[knowhere::meta::DIM] = dim;
+        hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+        hnsw_json[knowhere::meta::TOPK] = 1;
+        hnsw_json[knowhere::indexparam::HNSW_M] = 16;
+        hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+        hnsw_json[knowhere::indexparam::EF] = 200;
+
+        auto train_ds = GenDataSet(nb, dim, seed);
+        auto query_ds = GenDataSet(nq, dim, seed + 2);
+
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        auto res = cpu_idx.Build(train_ds, hnsw_json);
+        REQUIRE(res == knowhere::Status::success);
+
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        auto deser_res = gpu_idx.Deserialize(bs);
+        REQUIRE(deser_res == knowhere::Status::success);
+
+        const auto topk_values = {
+            std::make_tuple(5, 0.85f),
+            std::make_tuple(25, 0.85f),
+            std::make_tuple(100, 0.85f),
+        };
+
+        for (const auto& [topk, threshold] : topk_values) {
+            hnsw_json[knowhere::meta::TOPK] = topk;
+            auto results = gpu_idx.Search(query_ds, hnsw_json, nullptr);
+            REQUIRE(results.has_value());
+            auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, hnsw_json, nullptr);
+            float recall = GetKNNRecall(*gt.value(), *results.value());
+            REQUIRE(recall >= threshold);
+        }
+    }
+
+    SECTION("Test GPU HNSW Serialize/Deserialize Round Trip") {
+        knowhere::Json hnsw_json;
+        hnsw_json[knowhere::meta::DIM] = dim;
+        hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+        hnsw_json[knowhere::meta::TOPK] = 1;
+        hnsw_json[knowhere::indexparam::HNSW_M] = 16;
+        hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+        hnsw_json[knowhere::indexparam::EF] = 200;
+
+        auto train_ds = GenDataSet(nb, dim, seed);
+
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        auto res = cpu_idx.Build(train_ds, hnsw_json);
+        REQUIRE(res == knowhere::Status::success);
+
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        auto deser_res = gpu_idx.Deserialize(bs);
+        REQUIRE(deser_res == knowhere::Status::success);
+
+        // Self-search: each vector should find itself as nearest neighbor
+        auto results = gpu_idx.Search(train_ds, hnsw_json, nullptr);
+        REQUIRE(results.has_value());
+        auto ids = results.value()->GetIds();
+        int correct = 0;
+        for (int i = 0; i < nq; ++i) {
+            if (ids[i] == i)
+                correct++;
+        }
+        float self_recall = static_cast<float>(correct) / nq;
+        REQUIRE(self_recall >= 0.95f);
+    }
+
+    SECTION("Test GPU HNSW SQ8 Deserialization") {
+        // Build a CPU HNSW_SQ index, then load as GPU_HNSW
+        knowhere::Json hnsw_json;
+        hnsw_json[knowhere::meta::DIM] = dim;
+        hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+        hnsw_json[knowhere::meta::TOPK] = 1;
+        hnsw_json[knowhere::indexparam::HNSW_M] = 16;
+        hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+        hnsw_json[knowhere::indexparam::EF] = 200;
+
+        auto train_ds = GenDataSet(nb, dim, seed);
+        auto query_ds = GenDataSet(nq, dim, seed + 2);
+
+        auto cpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW_SQ, version)
+                           .value();
+        auto res = cpu_idx.Build(train_ds, hnsw_json);
+        REQUIRE(res == knowhere::Status::success);
+
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        // GPU_HNSW should accept HNSW_SQ binaries
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        auto deser_res = gpu_idx.Deserialize(bs);
+        REQUIRE(deser_res == knowhere::Status::success);
+
+        auto results = gpu_idx.Search(query_ds, hnsw_json, nullptr);
+        REQUIRE(results.has_value());
+
+        auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, hnsw_json, nullptr);
+        REQUIRE(gt.has_value());
+        float recall = GetKNNRecall(*gt.value(), *results.value());
+        // SQ8 has lower recall than flat due to quantization
+        REQUIRE(recall >= 0.7f);
+    }
 }
 #endif
