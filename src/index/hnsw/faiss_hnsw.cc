@@ -3360,8 +3360,8 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                 if (!gpu_resources_) {
                     gpu_resources_ = std::make_shared<faiss::gpu::StandardGpuResources>();
                 }
-                gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(
-                    gpu_resources_.get(), faiss_idx->d, faiss_idx->metric_type);
+                gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
+                                                                        faiss_idx->metric_type);
                 gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
             } catch (const std::exception& e) {
                 fprintf(stderr, "[gpu_hnsw] eager GPU upload failed: %s\n", e.what());
@@ -3392,12 +3392,12 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                     if (!gpu_resources_) {
                         gpu_resources_ = std::make_shared<faiss::gpu::StandardGpuResources>();
                     }
-                    gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(
-                        gpu_resources_.get(), faiss_idx->d, faiss_idx->metric_type);
+                    gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
+                                                                            faiss_idx->metric_type);
                     gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
                 } catch (const std::exception& e) {
                     return expected<DataSetPtr>::Err(Status::cuvs_inner_error,
-                        std::string("failed to build GPU HNSW index: ") + e.what());
+                                                     std::string("failed to build GPU HNSW index: ") + e.what());
                 }
             }
         }
@@ -3434,7 +3434,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
             gpu_index_->search(nq, h_queries, k, h_dist.get(), h_ids.get(), &sp);
         } catch (const std::exception& e) {
             return expected<DataSetPtr>::Err(Status::cuvs_inner_error,
-                std::string("GPU HNSW search failed: ") + e.what());
+                                             std::string("GPU HNSW search failed: ") + e.what());
         }
 
         // Negate back to positive for IP and COSINE.
