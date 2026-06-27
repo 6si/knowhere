@@ -3353,9 +3353,12 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         const auto* faiss_idx = GetFaissHnswIndex();
         if (faiss_idx) {
             try {
-                const auto& hnsw_cfg = static_cast<const FaissHnswConfig&>(*cfg);
-                bool is_cosine = IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE);
-                bool use_ip = IsMetricType(hnsw_cfg.metric_type.value(), metric::IP) || is_cosine;
+                // Detect metric from the FAISS index type rather than config,
+                // because Deserialize may be called without metric_type in the config
+                // (e.g. empty json defaults metric_type to L2).
+                bool is_cosine =
+                    dynamic_cast<const ::faiss::cppcontrib::knowhere::HasInverseL2Norms*>(faiss_idx) != nullptr;
+                bool use_ip = is_cosine || (faiss_idx->metric_type == ::faiss::METRIC_INNER_PRODUCT);
 
                 if (!gpu_resources_) {
                     gpu_resources_ = std::make_shared<faiss::gpu::StandardGpuResources>();

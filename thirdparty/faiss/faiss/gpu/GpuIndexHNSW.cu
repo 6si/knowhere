@@ -22,6 +22,7 @@
  */
 
 #include <faiss/IndexScalarQuantizer.h>
+#include <faiss/cppcontrib/knowhere/IndexCosine.h>
 #include <faiss/cppcontrib/knowhere/IndexHNSW.h>
 #include <faiss/gpu/GpuIndexHNSW.h>
 #include <faiss/gpu/impl/GpuHnswTypes.h>
@@ -59,8 +60,13 @@ void GpuIndexHNSW::copyFrom(
     this->metric_type = index->metric_type;
     this->ntotal = index->ntotal;
 
-    bool use_ip = (index->metric_type == faiss::METRIC_INNER_PRODUCT);
-    bool is_cosine = false;
+    // Detect cosine from index type (IndexHNSWFlatCosine / IndexHNSWSQCosine
+    // implement HasInverseL2Norms).
+    bool is_cosine = dynamic_cast<
+                             const faiss::cppcontrib::knowhere::HasInverseL2Norms*>(
+                             index) != nullptr;
+    bool use_ip =
+            is_cosine || (index->metric_type == faiss::METRIC_INNER_PRODUCT);
 
     if (dynamic_cast<const faiss::IndexScalarQuantizer*>(index->storage)) {
         deviceIndex_ = from_faiss_hnsw_sq(*index, use_ip, is_cosine);
