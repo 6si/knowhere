@@ -24,6 +24,7 @@
 #include <faiss/IndexScalarQuantizer.h>
 #include <faiss/cppcontrib/knowhere/IndexHNSW.h>
 #include <faiss/gpu/GpuIndexHNSW.h>
+#include <faiss/gpu/utils/DeviceUtils.h>
 #include <faiss/gpu/impl/GpuHnswBuild.cuh>
 #include <faiss/gpu/impl/GpuHnswSearch.cuh>
 #include <faiss/gpu/impl/GpuHnswTypes.h>
