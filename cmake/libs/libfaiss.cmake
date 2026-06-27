@@ -540,6 +540,7 @@ if(WITH_CUVS)
     thirdparty/faiss/faiss/gpu/GpuResources.cpp
     thirdparty/faiss/faiss/gpu/StandardGpuResources.cpp
     thirdparty/faiss/faiss/gpu/impl/GpuHnswTypes.cu
+    thirdparty/faiss/faiss/gpu/impl/IndexUtils.cu
     thirdparty/faiss/faiss/gpu/utils/DeviceUtils.cu
     thirdparty/faiss/faiss/gpu/utils/StackDeviceMemory.cpp
     thirdparty/faiss/faiss/gpu/utils/Timer.cpp
