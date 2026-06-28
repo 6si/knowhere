@@ -3432,6 +3432,12 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         auto h_dist = std::make_unique<float[]>(nq * k);
 
         try {
+            // Set search params directly (avoids dynamic_cast in searchImpl_).
+            faiss::gpu::GpuHnswSearchParams gsp;
+            gsp.ef = ef;
+            gpu_index_->setSearchParams(gsp);
+
+            // Also pass via SearchParameters as fallback.
             faiss::gpu::SearchParametersGpuHNSW sp;
             sp.ef = ef;
             gpu_index_->search(nq, h_queries, k, h_dist.get(), h_ids.get(), &sp);
