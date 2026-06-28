@@ -3286,7 +3286,6 @@ KNOWHERE_SIMPLE_REGISTER_DENSE_INT_GLOBAL(HNSW_PRQ, BaseFaissRegularIndexHNSWPRQ
 #ifdef KNOWHERE_WITH_CUVS
 }  // namespace knowhere — temporarily close to include GPU headers at file scope
 // ── GPU HNSW ─────────────────────────────────────────────────────────────────
-#include <cuda_runtime.h>
 #include <faiss/gpu/GpuIndexHNSW.h>
 #include <faiss/gpu/StandardGpuResources.h>
 namespace knowhere {  // reopen namespace knowhere
@@ -3417,22 +3416,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         LOG_KNOWHERE_INFO_ << "GPU_HNSW Search: nq=" << nq << " k=" << k << " dim=" << dim << " ef=" << ef
                            << " metric=" << hnsw_cfg.metric_type.value()
                            << " gpu_index=" << (gpu_index_ ? "yes" : "null");
-        const auto* queries_raw = reinterpret_cast<const float*>(dataset->GetTensor());
-
-        // GetTensor() may return a device pointer in GPU querynode context.
-        // Copy to host if needed — COSINE normalization and searchHost() require host memory.
-        std::unique_ptr<float[]> host_queries_buf;
-        const float* h_queries_raw = queries_raw;
-        cudaPointerAttributes attr;
-        cudaError_t attr_err = cudaPointerGetAttributes(&attr, queries_raw);
-        if (attr_err == cudaSuccess && (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged)) {
-            host_queries_buf = std::make_unique<float[]>(nq * dim);
-            cudaMemcpy(host_queries_buf.get(), queries_raw, static_cast<size_t>(nq) * dim * sizeof(float),
-                       cudaMemcpyDeviceToHost);
-            h_queries_raw = host_queries_buf.get();
-        } else if (attr_err != cudaSuccess) {
-            cudaGetLastError();  // clear the error
-        }
+        const auto* h_queries_raw = reinterpret_cast<const float*>(dataset->GetTensor());
 
         // For COSINE metric, normalize queries to unit length.
         const float* h_queries = h_queries_raw;
