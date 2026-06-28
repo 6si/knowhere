@@ -82,8 +82,7 @@ struct GpuIndexHNSW : public GpuIndex {
     /// The CPU index must have been built and trained already.
     /// Supports IndexHNSWFlat (float32) and IndexHNSWSQ
     /// (QT_8bit_direct_signed for INT8, or dequantized for other SQ types).
-    void copyFrom(
-            const faiss::cppcontrib::knowhere::IndexHNSW* index);
+    void copyFrom(const faiss::cppcontrib::knowhere::IndexHNSW* index);
 
     /// Load with explicit metric specification.
     void copyFromWithMetric(
@@ -96,6 +95,18 @@ struct GpuIndexHNSW : public GpuIndex {
     /// Set search parameters directly, bypassing SearchParameters.
     /// Thread-safe: uses atomic/mutex internally.
     void setSearchParams(const GpuHnswSearchParams& params) const;
+
+    /// Search with host pointers directly, bypassing GpuIndex::search.
+    /// All input/output pointers must be host memory.
+    /// This avoids the GpuIndex::search_ex temp allocation chain
+    /// which can cause SIGSEGV from pointer lifetime issues.
+    void searchHost(
+            idx_t n,
+            const float* x_host,
+            int k,
+            float* distances_host,
+            idx_t* labels_host,
+            const GpuHnswSearchParams& params) const;
 
    protected:
     bool addImplRequiresIDs_() const override;

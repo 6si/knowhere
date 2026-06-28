@@ -3438,16 +3438,13 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         auto h_dist = std::make_unique<float[]>(nq * k);
 
         try {
-            // Set search params directly (avoids dynamic_cast in searchImpl_).
             faiss::gpu::GpuHnswSearchParams gsp;
             gsp.ef = ef;
-            gpu_index_->setSearchParams(gsp);
-            LOG_KNOWHERE_INFO_ << "GPU_HNSW calling gpu_index_->search with ef=" << ef;
+            LOG_KNOWHERE_INFO_ << "GPU_HNSW calling searchHost with ef=" << ef;
 
-            // Also pass via SearchParameters as fallback.
-            faiss::gpu::SearchParametersGpuHNSW sp;
-            sp.ef = ef;
-            gpu_index_->search(nq, h_queries, k, h_dist.get(), h_ids.get(), &sp);
+            // Use searchHost() which takes host pointers directly,
+            // bypassing GpuIndex::search_ex temp allocation chain.
+            gpu_index_->searchHost(nq, h_queries, k, h_dist.get(), h_ids.get(), gsp);
             LOG_KNOWHERE_INFO_ << "GPU_HNSW search completed, first_id=" << h_ids[0] << " first_dist=" << h_dist[0];
         } catch (const std::exception& e) {
             LOG_KNOWHERE_ERROR_ << "GPU_HNSW search failed: " << e.what();
