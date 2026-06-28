@@ -3362,6 +3362,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
 
                 if (!gpu_resources_) {
                     gpu_resources_ = std::make_shared<faiss::gpu::StandardGpuResources>();
+                    gpu_resources_->setTempMemory(0);
                 }
                 gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
                                                                         faiss_idx->metric_type);
@@ -3397,6 +3398,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
 
                     if (!gpu_resources_) {
                         gpu_resources_ = std::make_shared<faiss::gpu::StandardGpuResources>();
+                        gpu_resources_->setTempMemory(0);
                     }
                     gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
                                                                             faiss_idx->metric_type);
