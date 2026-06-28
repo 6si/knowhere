@@ -77,6 +77,7 @@ inline void gpu_hnsw_search(
             idx.max_degree0,
             static_cast<int>(idx.use_ip),
             num_upper_layers);
+    fflush(stderr);
 
     auto launch_kernels = [&]<typename DataT>(
                                   const DataT* d_data,
@@ -124,6 +125,7 @@ inline void gpu_hnsw_search(
                         "[gpu_hnsw] clamping ef %d -> %d (smem limit)\n",
                         ef,
                         max_ef);
+                fflush(stderr);
                 ef = max_ef;
             }
         }
