@@ -3367,6 +3367,8 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                 gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
                                                                         faiss_idx->metric_type);
                 gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
+                // Release CPU copy — vectors and graph are now on GPU.
+                indexes[0].reset();
             } catch (const std::exception& e) {
                 fprintf(stderr, "[gpu_hnsw] eager GPU upload failed: %s\n", e.what());
                 gpu_index_.reset();
@@ -3403,6 +3405,8 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                     gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
                                                                             faiss_idx->metric_type);
                     gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
+                    // Release CPU copy — vectors and graph are now on GPU.
+                    indexes[0].reset();
                 } catch (const std::exception& e) {
                     return expected<DataSetPtr>::Err(Status::cuvs_inner_error,
                                                      std::string("failed to build GPU HNSW index: ") + e.what());
