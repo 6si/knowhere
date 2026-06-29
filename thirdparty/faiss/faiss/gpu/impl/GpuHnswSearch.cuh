@@ -119,11 +119,13 @@ inline void gpu_hnsw_search(
 
         GPU_HNSW_CUDA_CHECK(
                 cudaMemsetAsync(sc.d_visited_bitmaps, 0, bitmap_bytes, stream));
-        GPU_HNSW_CUDA_CHECK(cudaMemsetAsync(
-                sc.d_overflow_count,
-                0,
-                static_cast<size_t>(num_queries) * sizeof(int),
-                stream));
+        if (overflow_ef > 0) {
+            GPU_HNSW_CUDA_CHECK(cudaMemsetAsync(
+                    sc.d_overflow_count,
+                    0,
+                    static_cast<size_t>(num_queries) * sizeof(int),
+                    stream));
+        }
 
         hnsw_kernel::layer0_beam_search_kernel<DataT>
                 <<<num_queries, block_size, smem_size, stream>>>(
