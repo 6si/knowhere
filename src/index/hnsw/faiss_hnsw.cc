@@ -3290,6 +3290,21 @@ KNOWHERE_SIMPLE_REGISTER_DENSE_INT_GLOBAL(HNSW_PRQ, BaseFaissRegularIndexHNSWPRQ
 #include <faiss/gpu/StandardGpuResources.h>
 namespace knowhere {  // reopen namespace knowhere
 
+// Process-global StandardGpuResources shared by all GpuHnswIndexNode instances.
+// Avoids per-segment 256 MiB pinned memory, cuBLAS handle, and CUDA stream
+// allocations that accumulate to tens of GiB with many segments.
+static std::shared_ptr<faiss::gpu::StandardGpuResources>&
+GetSharedGpuResources() {
+    static std::once_flag flag;
+    static std::shared_ptr<faiss::gpu::StandardGpuResources> instance;
+    std::call_once(flag, [] {
+        instance = std::make_shared<faiss::gpu::StandardGpuResources>();
+        instance->setTempMemory(0);
+        instance->setPinnedMemory(0);
+    });
+    return instance;
+}
+
 // Single GPU HNSW index node that handles all CPU storage formats (F32, SQ8,
 // FP16, BF16) transparently. Uses faiss::gpu::GpuIndexHNSW for GPU search.
 // Accepts CPU-serialized HNSW or HNSW_SQ binaries at load time.
@@ -3360,10 +3375,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                     dynamic_cast<const ::faiss::cppcontrib::knowhere::HasInverseL2Norms*>(faiss_idx) != nullptr;
                 bool use_ip = is_cosine || (faiss_idx->metric_type == ::faiss::METRIC_INNER_PRODUCT);
 
-                if (!gpu_resources_) {
-                    gpu_resources_ = std::make_shared<faiss::gpu::StandardGpuResources>();
-                    gpu_resources_->setTempMemory(0);
-                }
+                gpu_resources_ = GetSharedGpuResources();
                 gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
                                                                         faiss_idx->metric_type);
                 gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
@@ -3398,10 +3410,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                     bool is_cosine = IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE);
                     bool use_ip = IsMetricType(hnsw_cfg.metric_type.value(), metric::IP) || is_cosine;
 
-                    if (!gpu_resources_) {
-                        gpu_resources_ = std::make_shared<faiss::gpu::StandardGpuResources>();
-                        gpu_resources_->setTempMemory(0);
-                    }
+                    gpu_resources_ = GetSharedGpuResources();
                     gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
                                                                             faiss_idx->metric_type);
                     gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
