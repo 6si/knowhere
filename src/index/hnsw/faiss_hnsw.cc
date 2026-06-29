@@ -3413,8 +3413,8 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     expected<DataSetPtr>
     Search(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
            milvus::OpContext* op_context) const override {
-        LOG_KNOWHERE_INFO_ << "GPU_HNSW Search called, bitset.empty=" << bitset.empty()
-                           << " bitset.count=" << (bitset.empty() ? 0 : bitset.count());
+        LOG_KNOWHERE_DEBUG_ << "GPU_HNSW Search called, bitset.empty=" << bitset.empty()
+                            << " bitset.count=" << (bitset.empty() ? 0 : bitset.count());
         if (!bitset.empty() && bitset.count() > 0) {
             LOG_KNOWHERE_WARNING_ << "GPU_HNSW rejecting filtered search, bitset.count=" << bitset.count();
             return expected<DataSetPtr>::Err(Status::invalid_args, "GPU_HNSW does not support filtered search");
@@ -3454,9 +3454,9 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         auto nq = dataset->GetRows();
         auto dim = dataset->GetDim();
         auto ef = hnsw_cfg.ef.value_or(200);
-        LOG_KNOWHERE_INFO_ << "GPU_HNSW Search: nq=" << nq << " k=" << k << " dim=" << dim << " ef=" << ef
-                           << " metric=" << hnsw_cfg.metric_type.value()
-                           << " gpu_index=" << (gpu_index_ ? "yes" : "null");
+        LOG_KNOWHERE_DEBUG_ << "GPU_HNSW Search: nq=" << nq << " k=" << k << " dim=" << dim << " ef=" << ef
+                            << " metric=" << hnsw_cfg.metric_type.value()
+                            << " gpu_index=" << (gpu_index_ ? "yes" : "null");
         const auto* h_queries_raw = reinterpret_cast<const float*>(dataset->GetTensor());
 
         // For COSINE metric, normalize queries to unit length.
@@ -3481,12 +3481,12 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         try {
             faiss::gpu::GpuHnswSearchParams gsp;
             gsp.ef = ef;
-            LOG_KNOWHERE_INFO_ << "GPU_HNSW calling searchHost with ef=" << ef;
+            LOG_KNOWHERE_DEBUG_ << "GPU_HNSW calling searchHost with ef=" << ef;
 
             // Use searchHost() which takes host pointers directly,
             // bypassing GpuIndex::search_ex temp allocation chain.
             gpu_index_->searchHost(nq, h_queries, k, h_dist.get(), h_ids.get(), gsp);
-            LOG_KNOWHERE_INFO_ << "GPU_HNSW search completed, first_id=" << h_ids[0] << " first_dist=" << h_dist[0];
+            LOG_KNOWHERE_DEBUG_ << "GPU_HNSW search completed, first_id=" << h_ids[0] << " first_dist=" << h_dist[0];
         } catch (const std::exception& e) {
             LOG_KNOWHERE_ERROR_ << "GPU_HNSW search failed: " << e.what();
             return expected<DataSetPtr>::Err(Status::cuvs_inner_error,
