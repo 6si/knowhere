@@ -3406,7 +3406,9 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                                                                             faiss_idx->metric_type);
                     gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
                     // Release CPU copy — vectors and graph are now on GPU.
-                    indexes[0].reset();
+                    // Search() is const, but releasing the CPU index after GPU
+                    // upload is safe and necessary to avoid RAM OOM.
+                    const_cast<std::shared_ptr<faiss::Index>&>(indexes[0]).reset();
                 } catch (const std::exception& e) {
                     return expected<DataSetPtr>::Err(Status::cuvs_inner_error,
                                                      std::string("failed to build GPU HNSW index: ") + e.what());
