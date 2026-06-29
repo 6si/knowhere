@@ -3324,6 +3324,15 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         return true;
     }
 
+    static expected<Resource>
+    StaticEstimateLoadResource(const uint64_t file_size_in_bytes, const int64_t num_rows, const int64_t dim,
+                               const knowhere::BaseConfig& config, const IndexVersion& version) {
+        // GPU HNSW stores vectors and graph in VRAM; the CPU copy is freed
+        // after upload in Deserialize(). Report zero CPU memory cost so the
+        // Milvus segment loader does not over-commit host RAM reservations.
+        return Resource{.memoryCost = 0, .diskCost = 0};
+    }
+
     std::unique_ptr<BaseConfig>
     CreateConfig() const override {
         return StaticCreateConfig();
