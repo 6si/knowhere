@@ -3305,6 +3305,15 @@ GetSharedGpuResources() {
     return instance;
 }
 
+// Serialize GpuIndexHNSW construction across segments.
+// StandardGpuResourcesImpl::initializeForDevice is not thread-safe;
+// concurrent constructors race on the allocs_ map assertion.
+static std::mutex&
+GetGpuConstructionMutex() {
+    static std::mutex mtx;
+    return mtx;
+}
+
 // Single GPU HNSW index node that handles all CPU storage formats (F32, SQ8,
 // FP16, BF16) transparently. Uses faiss::gpu::GpuIndexHNSW for GPU search.
 // Accepts CPU-serialized HNSW or HNSW_SQ binaries at load time.
@@ -3384,9 +3393,12 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                     dynamic_cast<const ::faiss::cppcontrib::knowhere::HasInverseL2Norms*>(faiss_idx) != nullptr;
                 bool use_ip = is_cosine || (faiss_idx->metric_type == ::faiss::METRIC_INNER_PRODUCT);
 
-                gpu_resources_ = GetSharedGpuResources();
-                gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
-                                                                        faiss_idx->metric_type);
+                {
+                    std::lock_guard<std::mutex> gpu_ctor_lock(GetGpuConstructionMutex());
+                    gpu_resources_ = GetSharedGpuResources();
+                    gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
+                                                                            faiss_idx->metric_type);
+                }
                 gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
                 // Release CPU copy — vectors and graph are now on GPU.
                 indexes[0].reset();
@@ -3419,9 +3431,12 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                     bool is_cosine = IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE);
                     bool use_ip = IsMetricType(hnsw_cfg.metric_type.value(), metric::IP) || is_cosine;
 
-                    gpu_resources_ = GetSharedGpuResources();
-                    gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
-                                                                            faiss_idx->metric_type);
+                    {
+                        std::lock_guard<std::mutex> gpu_ctor_lock(GetGpuConstructionMutex());
+                        gpu_resources_ = GetSharedGpuResources();
+                        gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
+                                                                                faiss_idx->metric_type);
+                    }
                     gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
                     // Release CPU copy — vectors and graph are now on GPU.
                     // Search() is const, but releasing the CPU index after GPU
