@@ -183,8 +183,6 @@ void GpuIndexHNSW::searchImpl_(
 
     gpu_hnsw_search(stream, sp, idx, nq, k);
 
-    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
-
     // D2D: distances (output is a device pointer from GpuIndex::search)
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             distances,
@@ -195,11 +193,13 @@ void GpuIndexHNSW::searchImpl_(
 
     // Labels: D2H stage (uint64_t→idx_t conversion), then H2D back
     auto tmp = std::make_unique<uint64_t[]>(nq * k);
-    GPU_HNSW_CUDA_CHECK(cudaMemcpy(
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             tmp.get(),
             sc.d_neighbors,
             static_cast<size_t>(nq) * k * sizeof(uint64_t),
-            cudaMemcpyDeviceToHost));
+            cudaMemcpyDeviceToHost,
+            stream));
+    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto h_labels = std::make_unique<idx_t[]>(nq * k);
     for (int i = 0; i < nq * k; i++) {
@@ -254,22 +254,24 @@ void GpuIndexHNSW::searchHost(
 
     gpu_hnsw_search(stream, sp, idx, nq, k);
 
-    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // D2H: distances directly to host output
-    GPU_HNSW_CUDA_CHECK(cudaMemcpy(
+    // D2H: distances via async copy on the search stream
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             distances_host,
             sc.d_distances,
             static_cast<size_t>(nq) * k * sizeof(float),
-            cudaMemcpyDeviceToHost));
+            cudaMemcpyDeviceToHost,
+            stream));
 
     // D2H: labels with uint64_t → idx_t conversion
     auto tmp = std::make_unique<uint64_t[]>(nq * k);
-    GPU_HNSW_CUDA_CHECK(cudaMemcpy(
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             tmp.get(),
             sc.d_neighbors,
             static_cast<size_t>(nq) * k * sizeof(uint64_t),
-            cudaMemcpyDeviceToHost));
+            cudaMemcpyDeviceToHost,
+            stream));
+
+    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
 
     for (int i = 0; i < nq * k; i++) {
         labels_host[i] =
