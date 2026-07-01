@@ -289,8 +289,7 @@ inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_sq(
     idx->n_rows = n_rows;
     idx->dim = dim;
     idx->use_ip = use_ip;
-    GPU_HNSW_BUILD_CUDA_CHECK(
-            cudaStreamCreateWithFlags(&idx->search_stream, cudaStreamNonBlocking));
+    idx->scratch_pool = std::make_unique<GpuHnswScratchPool>(4, 0);
 
     bool is_direct_signed = (sq_storage->sq.qtype ==
                              faiss::ScalarQuantizer::QT_8bit_direct_signed);
@@ -331,8 +330,7 @@ inline std::unique_ptr<GpuHnswDeviceIndex> from_faiss_hnsw_flat(
     idx->n_rows = n_rows;
     idx->dim = dim;
     idx->use_ip = use_ip;
-    GPU_HNSW_BUILD_CUDA_CHECK(
-            cudaStreamCreateWithFlags(&idx->search_stream, cudaStreamNonBlocking));
+    idx->scratch_pool = std::make_unique<GpuHnswScratchPool>(4, 0);
 
     upload_fp32_dataset(*idx, h_vectors, n_rows, is_cosine);
     upload_graph_to_gpu(*idx, hnsw_index.hnsw, n_rows);
