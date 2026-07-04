@@ -419,16 +419,12 @@ GenerateRandomDistanceIdPair(size_t n) {
 
 inline auto
 GenTestVersionList() {
-    return GENERATE(as<int32_t>{}, knowhere::Version::GetCurrentVersion().VersionNumber());
+    return GENERATE(as<int32_t>{}, knowhere::Version::GetMaximumVersion().VersionNumber());
 }
 
 inline auto
 GenTestEmbListVersionList() {
-#ifdef KNOWHERE_WITH_CARDINAL
-    return GENERATE(as<int32_t>{}, std::max(knowhere::Version::GetCurrentVersion().VersionNumber(), 9));
-#else
-    return GENERATE(as<int32_t>{}, knowhere::Version::GetCurrentVersion().VersionNumber());
-#endif
+    return GENERATE(as<int32_t>{}, knowhere::Version::GetMaximumVersion().VersionNumber());
 }
 
 inline knowhere::DataSetPtr

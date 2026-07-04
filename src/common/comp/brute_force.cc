@@ -35,6 +35,7 @@
 #include "simd/hook.h"
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
+#include "common/Tracer.h"
 #include "knowhere/tracer.h"
 #endif
 
@@ -143,9 +144,26 @@ GetInverseVecNorms(const DataSetPtr& base) {
 }  // namespace
 
 template <typename DataType>
+Status
+BruteForceSearchWithBufImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids, float* dis,
+                            const Json& config, const BitsetView& bitset, milvus::OpContext* op_context);
+
+template <typename DataType>
+Status
+BruteForceSearchOnChunkWithBufImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids,
+                                   float* dis, const Json& config, const BitsetView& bitset,
+                                   milvus::OpContext* op_context);
+
+template <typename DataType>
+expected<std::vector<IndexNode::IteratorPtr>>
+BruteForceAnnIteratorOnChunkImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                                 const BitsetView& bitset, bool use_knowhere_search_pool,
+                                 milvus::OpContext* op_context);
+
+template <typename DataType>
 expected<DataSetPtr>
-BruteForce::Search(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
-                   const BitsetView& bitset_, milvus::OpContext* op_context) {
+BruteForceSearchImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                     const BitsetView& bitset_, milvus::OpContext* op_context) {
     BruteForceConfig cfg;
     std::string msg;
     auto status = Config::Load(cfg, config, knowhere::SEARCH, &msg);
@@ -172,11 +190,11 @@ BruteForce::Search(const DataSetPtr base_dataset, const DataSetPtr query_dataset
     Status search_status;
     bool base_is_chunk = base_dataset->GetIsChunk();
     if (base_is_chunk) {
-        search_status = SearchOnChunkWithBuf<DataType>(base_dataset, query_dataset, labels.get(), distances.get(),
-                                                       config, bitset_, op_context);
+        search_status = BruteForceSearchOnChunkWithBufImpl<DataType>(base_dataset, query_dataset, labels.get(),
+                                                                     distances.get(), config, bitset_, op_context);
     } else {
-        search_status = SearchWithBuf<DataType>(base_dataset, query_dataset, labels.get(), distances.get(), config,
-                                                bitset_, op_context);
+        search_status = BruteForceSearchWithBufImpl<DataType>(base_dataset, query_dataset, labels.get(),
+                                                              distances.get(), config, bitset_, op_context);
     }
     if (search_status != Status::success) {
         return expected<DataSetPtr>::Err(search_status, "search failed");
@@ -468,11 +486,12 @@ brute_force_emb_list_impl(const void* xq, size_t query_el_idx, const void* xb, i
 
 template <typename DataType>
 Status
-BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids, float* dis,
-                          const Json& config, const BitsetView& bitset_, milvus::OpContext* op_context) {
+BruteForceSearchWithBufImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids, float* dis,
+                            const Json& config, const BitsetView& bitset_, milvus::OpContext* op_context) {
     auto base_is_chunk = base_dataset->GetIsChunk();
     if (base_is_chunk) {
-        return SearchOnChunkWithBuf<DataType>(base_dataset, query_dataset, ids, dis, config, bitset_, op_context);
+        return BruteForceSearchOnChunkWithBufImpl<DataType>(base_dataset, query_dataset, ids, dis, config, bitset_,
+                                                            op_context);
     }
     auto xb = base_dataset->GetTensor();
     auto nb = base_dataset->GetRows();
@@ -491,19 +510,14 @@ BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf search with buf", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::TOPK, cfg.k.value());
-        span->SetAttribute(meta::ROWS, nb);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf search with buf", op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::TOPK, cfg.k.value());
+        span_ptr->SetAttribute(meta::ROWS, nb);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -599,22 +613,14 @@ BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_
         }
     }
 
-#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
-    // LCOV_EXCL_START
-    if (cfg.trace_id.has_value()) {
-        span->End();
-    }
-    // LCOV_EXCL_STOP
-#endif
-
     return Status::success;
 }
 
 template <typename DataType>
 Status
-BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids,
-                                 float* dis, const Json& config, const BitsetView& bitset_,
-                                 milvus::OpContext* op_context) {
+BruteForceSearchOnChunkWithBufImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids,
+                                   float* dis, const Json& config, const BitsetView& bitset_,
+                                   milvus::OpContext* op_context) {
     auto base_is_chunk = base_dataset->GetIsChunk();
     if (!base_is_chunk) {
         LOG_KNOWHERE_ERROR_ << "Base dataset is not chunk, should NOT use it.";
@@ -655,19 +661,15 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf search [on chunk] with buf", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::TOPK, cfg.k.value());
-        span->SetAttribute(meta::ROWS, num_total_vectors);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf search [on chunk] with buf",
+                                                                       op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::TOPK, cfg.k.value());
+        span_ptr->SetAttribute(meta::ROWS, num_total_vectors);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -912,8 +914,8 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
  */
 template <typename DataType>
 expected<DataSetPtr>
-BruteForce::RangeSearch(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
-                        const BitsetView& bitset_, milvus::OpContext* op_context) {
+BruteForceRangeSearchImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                          const BitsetView& bitset_, milvus::OpContext* op_context) {
     DataSetPtr query(query_dataset);
     auto xb = base_dataset->GetTensor();
     auto nb = base_dataset->GetRows();
@@ -933,22 +935,17 @@ BruteForce::RangeSearch(const DataSetPtr base_dataset, const DataSetPtr query_da
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf range search", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::RADIUS, cfg.radius.value());
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf range search", op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::RADIUS, cfg.radius.value());
         if (cfg.range_filter.value() != defaultRangeFilter) {
-            span->SetAttribute(meta::RANGE_FILTER, cfg.range_filter.value());
+            span_ptr->SetAttribute(meta::RANGE_FILTER, cfg.range_filter.value());
         }
-        span->SetAttribute(meta::ROWS, nb);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+        span_ptr->SetAttribute(meta::ROWS, nb);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -1120,21 +1117,13 @@ BruteForce::RangeSearch(const DataSetPtr base_dataset, const DataSetPtr query_da
         GetRangeSearchResult(result_dist_array, result_id_array, the_larger_the_closer, nq, radius, range_filter);
     auto res = GenResultDataSet(nq, std::move(range_search_result));
 
-#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
-    // LCOV_EXCL_START
-    if (cfg.trace_id.has_value()) {
-        span->End();
-    }
-    // LCOV_EXCL_STOP
-#endif
-
     return res;
 }
 
 Status
-BruteForce::SearchSparseWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, sparse::label_t* labels,
-                                float* distances, const Json& config, const BitsetView& bitset,
-                                milvus::OpContext* op_context) {
+BruteForceSearchSparseWithBufImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset,
+                                  sparse::label_t* labels, float* distances, const Json& config,
+                                  const BitsetView& bitset, milvus::OpContext* op_context) {
     auto base = static_cast<const sparse::SparseRow<float>*>(base_dataset->GetTensor());
     auto rows = base_dataset->GetRows();
     auto xb_id_offset = base_dataset->GetTensorBeginId();
@@ -1153,19 +1142,15 @@ BruteForce::SearchSparseWithBuf(const DataSetPtr base_dataset, const DataSetPtr 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
     auto dim = base_dataset->GetDim();
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf search sparse with buf", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::TOPK, cfg.k.value());
-        span->SetAttribute(meta::ROWS, rows);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span =
+        knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf search sparse with buf", op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::TOPK, cfg.k.value());
+        span_ptr->SetAttribute(meta::ROWS, rows);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -1223,20 +1208,12 @@ BruteForce::SearchSparseWithBuf(const DataSetPtr base_dataset, const DataSetPtr 
     }
     WaitAllSuccess(futs);
 
-#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
-    // LCOV_EXCL_START
-    if (cfg.trace_id.has_value()) {
-        span->End();
-    }
-    // LCOV_EXCL_STOP
-#endif
-
     return Status::success;
 }
 
 expected<DataSetPtr>
-BruteForce::SearchSparse(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
-                         const BitsetView& bitset, milvus::OpContext* op_context) {
+BruteForceSearchSparseImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                           const BitsetView& bitset, milvus::OpContext* op_context) {
     auto nq = query_dataset->GetRows();
     BruteForceConfig cfg;
     std::string msg;
@@ -1249,18 +1226,22 @@ BruteForce::SearchSparse(const DataSetPtr base_dataset, const DataSetPtr query_d
     auto labels = std::make_unique<sparse::label_t[]>(nq * topk);
     auto distances = std::make_unique<float[]>(nq * topk);
 
-    SearchSparseWithBuf(base_dataset, query_dataset, labels.get(), distances.get(), config, bitset, op_context);
+    auto search_status = BruteForceSearchSparseWithBufImpl(base_dataset, query_dataset, labels.get(), distances.get(),
+                                                           config, bitset, op_context);
+    if (search_status != Status::success) {
+        return expected<DataSetPtr>::Err(search_status, "sparse search failed");
+    }
     return GenResultDataSet(nq, topk, std::move(labels), std::move(distances));
 }
 
 template <typename DataType>
 expected<std::vector<IndexNode::IteratorPtr>>
-BruteForce::AnnIterator(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
-                        const BitsetView& bitset_, bool use_knowhere_search_pool, milvus::OpContext* op_context) {
+BruteForceAnnIteratorImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                          const BitsetView& bitset_, bool use_knowhere_search_pool, milvus::OpContext* op_context) {
     auto base_is_chunk = base_dataset->GetIsChunk();
     if (base_is_chunk) {
-        return AnnIteratorOnChunk<DataType>(base_dataset, query_dataset, config, bitset_, use_knowhere_search_pool,
-                                            op_context);
+        return BruteForceAnnIteratorOnChunkImpl<DataType>(base_dataset, query_dataset, config, bitset_,
+                                                          use_knowhere_search_pool, op_context);
     }
     auto nb = base_dataset->GetRows();
     auto dim = base_dataset->GetDim();
@@ -1285,18 +1266,14 @@ BruteForce::AnnIterator(const DataSetPtr base_dataset, const DataSetPtr query_da
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf ann iterator initialization", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::ROWS, nb);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf ann iterator initialization",
+                                                                       op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::ROWS, nb);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -1438,21 +1415,14 @@ BruteForce::AnnIterator(const DataSetPtr base_dataset, const DataSetPtr query_da
         return expected<std::vector<IndexNode::IteratorPtr>>::Err(Status::brute_force_inner_error, e.what());
     }
 
-#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
-    // LCOV_EXCL_START
-    if (cfg.trace_id.has_value()) {
-        span->End();
-    }
-    // LCOV_EXCL_STOP
-#endif
     return vec;
 }
 
 template <typename DataType>
 expected<std::vector<IndexNode::IteratorPtr>>
-BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
-                               const BitsetView& bitset_, bool use_knowhere_search_pool,
-                               milvus::OpContext* op_context) {
+BruteForceAnnIteratorOnChunkImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                                 const BitsetView& bitset_, bool use_knowhere_search_pool,
+                                 milvus::OpContext* op_context) {
     auto base_is_chunk = base_dataset->GetIsChunk();
     if (!base_is_chunk) {
         LOG_KNOWHERE_ERROR_ << "Base dataset is not chunk, should NOT use it.";
@@ -1518,18 +1488,14 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf ann iterator initialization", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::ROWS, num_total_vectors);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf ann iterator initialization",
+                                                                       op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::ROWS, num_total_vectors);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -1705,10 +1671,10 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
 
 template <>
 expected<std::vector<IndexNode::IteratorPtr>>
-BruteForce::AnnIterator<knowhere::sparse::SparseRow<float>>(const DataSetPtr base_dataset,
-                                                            const DataSetPtr query_dataset, const Json& config,
-                                                            const BitsetView& bitset, bool use_knowhere_search_pool,
-                                                            milvus::OpContext* op_context) {
+BruteForceAnnIteratorImpl<knowhere::sparse::SparseRow<float>>(const DataSetPtr base_dataset,
+                                                              const DataSetPtr query_dataset, const Json& config,
+                                                              const BitsetView& bitset, bool use_knowhere_search_pool,
+                                                              milvus::OpContext* op_context) {
     auto rows = base_dataset->GetRows();
     auto xb_id_offset = base_dataset->GetTensorBeginId();
     auto nq = query_dataset->GetRows();
@@ -1727,18 +1693,13 @@ BruteForce::AnnIterator<knowhere::sparse::SparseRow<float>>(const DataSetPtr bas
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
     auto dim = base_dataset->GetDim();
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf iterator sparse", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, metric_str);
-        span->SetAttribute(meta::ROWS, rows);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf iterator sparse", op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, metric_str);
+        span_ptr->SetAttribute(meta::ROWS, rows);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -1788,15 +1749,85 @@ BruteForce::AnnIterator<knowhere::sparse::SparseRow<float>>(const DataSetPtr bas
         return expected<std::vector<IndexNode::IteratorPtr>>::Err(Status::brute_force_inner_error, e.what());
     }
 
-#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
-    // LCOV_EXCL_START
-    if (cfg.trace_id.has_value()) {
-        span->End();
-    }
-    // LCOV_EXCL_STOP
-#endif
-
     return vec;
+}
+
+template <typename DataType>
+expected<DataSetPtr>
+BruteForce::Search(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                   const BitsetView& bitset, milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> expected<DataSetPtr> {
+        return BruteForceSearchImpl<DataType>(base_dataset, query_dataset, config, bitset, op_context);
+    });
+}
+
+template <typename DataType>
+Status
+BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids, float* dis,
+                          const Json& config, const BitsetView& bitset, milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> Status {
+        return BruteForceSearchWithBufImpl<DataType>(base_dataset, query_dataset, ids, dis, config, bitset, op_context);
+    });
+}
+
+template <typename DataType>
+Status
+BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids,
+                                 float* dis, const Json& config, const BitsetView& bitset,
+                                 milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> Status {
+        return BruteForceSearchOnChunkWithBufImpl<DataType>(base_dataset, query_dataset, ids, dis, config, bitset,
+                                                            op_context);
+    });
+}
+
+template <typename DataType>
+expected<DataSetPtr>
+BruteForce::RangeSearch(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                        const BitsetView& bitset, milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> expected<DataSetPtr> {
+        return BruteForceRangeSearchImpl<DataType>(base_dataset, query_dataset, config, bitset, op_context);
+    });
+}
+
+Status
+BruteForce::SearchSparseWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, sparse::label_t* labels,
+                                float* distances, const Json& config, const BitsetView& bitset,
+                                milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> Status {
+        return BruteForceSearchSparseWithBufImpl(base_dataset, query_dataset, labels, distances, config, bitset,
+                                                 op_context);
+    });
+}
+
+expected<DataSetPtr>
+BruteForce::SearchSparse(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                         const BitsetView& bitset, milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> expected<DataSetPtr> {
+        return BruteForceSearchSparseImpl(base_dataset, query_dataset, config, bitset, op_context);
+    });
+}
+
+template <typename DataType>
+expected<std::vector<IndexNode::IteratorPtr>>
+BruteForce::AnnIterator(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                        const BitsetView& bitset, bool use_knowhere_search_pool,
+                        milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> expected<std::vector<IndexNode::IteratorPtr>> {
+        return BruteForceAnnIteratorImpl<DataType>(base_dataset, query_dataset, config, bitset,
+                                                   use_knowhere_search_pool, op_context);
+    });
+}
+
+template <typename DataType>
+expected<std::vector<IndexNode::IteratorPtr>>
+BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                               const BitsetView& bitset, bool use_knowhere_search_pool,
+                               milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> expected<std::vector<IndexNode::IteratorPtr>> {
+        return BruteForceAnnIteratorOnChunkImpl<DataType>(base_dataset, query_dataset, config, bitset,
+                                                          use_knowhere_search_pool, op_context);
+    });
 }
 
 template knowhere::expected<knowhere::DataSetPtr>
@@ -1903,5 +1934,9 @@ knowhere::BruteForce::AnnIterator<knowhere::bin1>(const knowhere::DataSetPtr bas
                                                   const knowhere::DataSetPtr query_dataset,
                                                   const knowhere::Json& config, const knowhere::BitsetView& bitset,
                                                   bool use_knowhere_search_pool, milvus::OpContext* op_context);
+template knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
+knowhere::BruteForce::AnnIterator<knowhere::sparse::SparseRow<float>>(
+    const knowhere::DataSetPtr base_dataset, const knowhere::DataSetPtr query_dataset, const knowhere::Json& config,
+    const knowhere::BitsetView& bitset, bool use_knowhere_search_pool, milvus::OpContext* op_context);
 
 }  // namespace knowhere
