@@ -47,6 +47,7 @@ struct GpuCuvsCagraConfig : public BaseConfig {
     CFG_INT hashmap_min_bitlen;
     CFG_FLOAT hashmap_max_fill_rate;
     CFG_INT nn_descent_niter;
+    CFG_INT num_random_samplings;
     CFG_BOOL adapt_for_cpu;
     CFG_INT ef;
     CFG_BOOL persistent;
@@ -110,6 +111,11 @@ struct GpuCuvsCagraConfig : public BaseConfig {
             .description("number of iterations for NN descent")
             .set_default(20)
             .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(num_random_samplings)
+            .description("number of initial random seed node sampling iterations")
+            .set_default(1)
+            .set_range(1, std::numeric_limits<CFG_INT::value_type>::max())
+            .for_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(adapt_for_cpu)
             .description("train on GPU search on CPU")
             .set_default(false)
@@ -180,6 +186,7 @@ to_cuvs_knowhere_config(GpuCuvsCagraConfig const& cfg) {
     result.hashmap_min_bitlen = cfg.hashmap_min_bitlen;
     result.hashmap_max_fill_rate = cfg.hashmap_max_fill_rate;
     result.nn_descent_niter = cfg.nn_descent_niter;
+    result.num_random_samplings = cfg.num_random_samplings;
     result.persistent = cfg.persistent;
 
     return result;

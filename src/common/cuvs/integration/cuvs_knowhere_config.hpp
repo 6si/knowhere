@@ -70,6 +70,7 @@ struct cuvs_knowhere_config {
     std::optional<int> hashmap_min_bitlen = std::nullopt;
     std::optional<float> hashmap_max_fill_rate = std::nullopt;
     std::optional<int> nn_descent_niter = std::nullopt;
+    std::optional<int> num_random_samplings = std::nullopt;
     std::optional<bool> persistent = std::nullopt;
 };
 
@@ -119,6 +120,7 @@ validate_cuvs_knowhere_config(cuvs_knowhere_config config) {
         config.hashmap_min_bitlen = config.hashmap_min_bitlen.value_or(0);
         config.hashmap_max_fill_rate = config.hashmap_max_fill_rate.value_or(0.5f);
         config.nn_descent_niter = config.nn_descent_niter.value_or(20);
+        config.num_random_samplings = config.num_random_samplings.value_or(1);
         config.persistent = config.persistent.value_or(false);
     }
     return config;
