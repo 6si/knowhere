@@ -189,7 +189,17 @@ build_algo_string_to_cagra_build_algo(std::string const& algo_string, int interm
                  cuvs::neighbors::cagra::graph_build_params::iterative_search_params>
         result = cuvs::neighbors::cagra::graph_build_params::ivf_pq_params();
     if (algo_string == "IVF_PQ") {
-        result = cuvs::neighbors::cagra::graph_build_params::ivf_pq_params();
+        if (metric == cuvs::distance::DistanceType::CosineExpanded) {
+            // The pre-built libcuvs IVF_PQ knn-graph builder rejects CosineExpanded
+            // (cagra_build.cuh: "Currently only L2Expanded or InnerProduct metric are supported").
+            // NN_DESCENT supports CosineExpanded, so fall back to it for cosine builds.
+            auto nn_desc_params =
+                cuvs::neighbors::cagra::graph_build_params::nn_descent_params(intermediate_graph_degree, metric);
+            nn_desc_params.max_iterations = nn_descent_niter;
+            result = nn_desc_params;
+        } else {
+            result = cuvs::neighbors::cagra::graph_build_params::ivf_pq_params();
+        }
     } else if (algo_string == "NN_DESCENT") {
         auto nn_desc_params =
             cuvs::neighbors::cagra::graph_build_params::nn_descent_params(intermediate_graph_degree, metric);
