@@ -122,7 +122,7 @@ metric_string_to_cuvs_distance_type(std::string const& metric_string) {
     if (metric_string == "L2") {
         result = cuvs::distance::DistanceType::L2Expanded;
     } else if (metric_string == "COSINE") {
-        result = cuvs::distance::DistanceType::InnerProduct;
+        result = cuvs::distance::DistanceType::CosineExpanded;
     } else if (metric_string == "L2SqrtExpanded") {
         result = cuvs::distance::DistanceType::L2SqrtExpanded;
     } else if (metric_string == "CosineExpanded") {
@@ -427,16 +427,9 @@ struct cuvs_knowhere_index<IndexKind, DataType>::impl {
         }
         auto const& res = get_device_resources_without_mempool();
         auto host_data = raft::make_host_matrix_view(data, row_count, feature_count);
-        if (config.metric_type == knowhere::metric::COSINE) {
-            auto device_data = raft::make_device_matrix<data_type, input_indexing_type>(res, row_count, feature_count);
-            auto device_data_view = device_data.view();
-            raft::copy(res, device_data_view, host_data);
-            raft::linalg::row_normalize<raft::linalg::NormType::L2Norm>(res, raft::make_const_mdspan(device_data_view),
-                                                                        device_data_view);
-            auto host_data_view = raft::make_host_matrix_view(const_cast<data_type*>(data), row_count, feature_count);
-            raft::copy(res, host_data_view, device_data_view);
-            res.sync_stream();
-        }
+        // COSINE is now mapped to CosineExpanded, which computes per-row L2 norms
+        // internally in float — pre-normalizing here would be both redundant and lossy
+        // for low-precision types (int8: fractions truncate to 0). Skip entirely.
 
         if (config.cache_dataset_on_device) {
             device_dataset_storage =
@@ -468,12 +461,8 @@ struct cuvs_knowhere_index<IndexKind, DataType>::impl {
         auto device_data_storage =
             raft::make_device_matrix<data_type, input_indexing_type>(res, row_count, feature_count);
         raft::copy(res, device_data_storage.view(), host_data);
-
-        if (config.metric_type == knowhere::metric::COSINE) {
-            auto device_data_view = device_data_storage.view();
-            raft::linalg::row_normalize<raft::linalg::NormType::L2Norm>(res, raft::make_const_mdspan(device_data_view),
-                                                                        device_data_view);
-        }
+        // COSINE is mapped to CosineExpanded, which handles query normalization in float
+        // internally. Skip the lossy int-typed pre-normalization here.
 
         auto device_bitset = std::optional<
             cuvs::core::bitset<knowhere_bitset_internal_data_type, knowhere_bitset_internal_indexing_type>>{};
