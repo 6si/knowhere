@@ -15,6 +15,9 @@
  * limitations under the License.
  */
 #pragma once
+#include <thrust/device_ptr.h>
+#include <thrust/transform.h>
+
 #include <cmath>
 #include <cstdint>
 #include <cuvs/core/bitset.hpp>
@@ -106,6 +109,46 @@ struct check_valid_entry {
 
 }  // namespace detail
 
+// COSINE over int8 data cannot be normalized in place: L2-normalizing directly
+// into an int8 buffer truncates the unit-length components (fractions in
+// [-1, 1]) toward 0, so the graph ends up built on ~zero vectors. Instead cast
+// int8 -> float, L2-normalize per row in float, then rescale by 127 (the int8
+// max) and round back to int8. Every stored vector then has ~equal L2 norm, so
+// ranking by InnerProduct matches ranking by cosine. (Reported scores are
+// ~127^2 * cosine, i.e. large, but the ordering/recall is correct.)
+struct int8_to_float_op {
+    __device__ float
+    operator()(std::int8_t x) const {
+        return static_cast<float>(x);
+    }
+};
+struct float_to_int8_scaled_op {
+    __device__ std::int8_t
+    operator()(float v) const {
+        float scaled = v * 127.0f;
+        scaled = fminf(fmaxf(scaled, -127.0f), 127.0f);
+        return static_cast<std::int8_t>(lrintf(scaled));
+    }
+};
+
+template <typename IndexingT, typename LayoutT>
+inline void
+normalize_int8_rows_for_cosine(raft::resources const& res,
+                               raft::device_matrix_view<std::int8_t, IndexingT, LayoutT> data_view) {
+    auto const row_count = data_view.extent(0);
+    auto const feature_count = data_view.extent(1);
+    auto const element_count = static_cast<std::size_t>(row_count) * static_cast<std::size_t>(feature_count);
+    auto float_data = raft::make_device_matrix<float, IndexingT>(res, row_count, feature_count);
+    auto policy = raft::resource::get_thrust_policy(res);
+    auto int8_ptr = thrust::device_pointer_cast(data_view.data_handle());
+    auto float_ptr = thrust::device_pointer_cast(float_data.data_handle());
+    thrust::transform(policy, int8_ptr, int8_ptr + element_count, float_ptr, int8_to_float_op{});
+    raft::linalg::row_normalize<raft::linalg::NormType::L2Norm>(res, raft::make_const_mdspan(float_data.view()),
+                                                                float_data.view());
+    thrust::transform(policy, float_ptr, float_ptr + element_count, int8_ptr, float_to_int8_scaled_op{});
+    raft::resource::sync_stream(res);
+}
+
 template <cuvs_proto::cuvs_index_kind IndexKind, typename DataType>
 using cuvs_index_t = typename detail::cuvs_index_type_mapper<true, IndexKind, DataType>::type;
 
@@ -122,7 +165,7 @@ metric_string_to_cuvs_distance_type(std::string const& metric_string) {
     if (metric_string == "L2") {
         result = cuvs::distance::DistanceType::L2Expanded;
     } else if (metric_string == "COSINE") {
-        result = cuvs::distance::DistanceType::CosineExpanded;
+        result = cuvs::distance::DistanceType::InnerProduct;
     } else if (metric_string == "L2SqrtExpanded") {
         result = cuvs::distance::DistanceType::L2SqrtExpanded;
     } else if (metric_string == "CosineExpanded") {
@@ -437,9 +480,20 @@ struct cuvs_knowhere_index<IndexKind, DataType>::impl {
         }
         auto const& res = get_device_resources_without_mempool();
         auto host_data = raft::make_host_matrix_view(data, row_count, feature_count);
-        // COSINE is now mapped to CosineExpanded, which computes per-row L2 norms
-        // internally in float — pre-normalizing here would be both redundant and lossy
-        // for low-precision types (int8: fractions truncate to 0). Skip entirely.
+        if (config.metric_type == knowhere::metric::COSINE) {
+            auto device_data = raft::make_device_matrix<data_type, input_indexing_type>(res, row_count, feature_count);
+            auto device_data_view = device_data.view();
+            raft::copy(res, device_data_view, host_data);
+            if constexpr (std::is_same_v<data_type, std::int8_t>) {
+                normalize_int8_rows_for_cosine(res, device_data_view);
+            } else {
+                raft::linalg::row_normalize<raft::linalg::NormType::L2Norm>(
+                    res, raft::make_const_mdspan(device_data_view), device_data_view);
+            }
+            auto host_data_view = raft::make_host_matrix_view(const_cast<data_type*>(data), row_count, feature_count);
+            raft::copy(res, host_data_view, device_data_view);
+            res.sync_stream();
+        }
 
         if (config.cache_dataset_on_device) {
             device_dataset_storage =
@@ -471,8 +525,15 @@ struct cuvs_knowhere_index<IndexKind, DataType>::impl {
         auto device_data_storage =
             raft::make_device_matrix<data_type, input_indexing_type>(res, row_count, feature_count);
         raft::copy(res, device_data_storage.view(), host_data);
-        // COSINE is mapped to CosineExpanded, which handles query normalization in float
-        // internally. Skip the lossy int-typed pre-normalization here.
+        if (config.metric_type == knowhere::metric::COSINE) {
+            auto device_data_view = device_data_storage.view();
+            if constexpr (std::is_same_v<data_type, std::int8_t>) {
+                normalize_int8_rows_for_cosine(res, device_data_view);
+            } else {
+                raft::linalg::row_normalize<raft::linalg::NormType::L2Norm>(
+                    res, raft::make_const_mdspan(device_data_view), device_data_view);
+            }
+        }
 
         auto device_bitset = std::optional<
             cuvs::core::bitset<knowhere_bitset_internal_data_type, knowhere_bitset_internal_indexing_type>>{};
