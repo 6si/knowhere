@@ -593,3 +593,26 @@ if(__PPC64)
                                       knowhere_utils)
   target_compile_definitions(faiss PRIVATE FINTEGER=int)
 endif()
+
+# GPU HNSW CUDA sources — compiled when WITH_CUVS is enabled
+if(WITH_CUVS)
+  set(FAISS_GPU_HNSW_SRCS
+    thirdparty/faiss/faiss/gpu/GpuIndexHNSW.cu
+    thirdparty/faiss/faiss/gpu/GpuIndex.cu
+    thirdparty/faiss/faiss/gpu/GpuResources.cpp
+    thirdparty/faiss/faiss/gpu/StandardGpuResources.cpp
+    thirdparty/faiss/faiss/gpu/impl/GpuHnswTypes.cu
+    thirdparty/faiss/faiss/gpu/impl/IndexUtils.cu
+    thirdparty/faiss/faiss/gpu/utils/DeviceUtils.cu
+    thirdparty/faiss/faiss/gpu/utils/StackDeviceMemory.cpp
+    thirdparty/faiss/faiss/gpu/utils/Timer.cpp
+  )
+  add_library(faiss_gpu_hnsw OBJECT ${FAISS_GPU_HNSW_SRCS})
+  target_include_directories(faiss_gpu_hnsw PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/faiss
+    ${Boost_INCLUDE_DIRS}
+  )
+  target_compile_definitions(faiss_gpu_hnsw PRIVATE FINTEGER=int)
+  target_link_libraries(faiss_gpu_hnsw PRIVATE CUDA::cudart)
+  target_link_libraries(faiss PUBLIC faiss_gpu_hnsw)
+endif()
