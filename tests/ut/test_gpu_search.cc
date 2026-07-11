@@ -474,6 +474,11 @@ TEST_CASE("Test All GPU Index", "[search]") {
         auto deser_res = gpu_idx.Deserialize(bs);
         REQUIRE(deser_res == knowhere::Status::success);
 
+        // Count()/Dim() must survive the CPU-copy release after GPU upload;
+        // regression guard for returning -1 (segment treated as empty).
+        REQUIRE(gpu_idx.Count() == nb);
+        REQUIRE(gpu_idx.Dim() == dim);
+
         // Search on GPU
         auto results = gpu_idx.Search(query_ds, hnsw_json, nullptr);
         REQUIRE(results.has_value());

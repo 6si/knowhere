@@ -21,12 +21,14 @@
 #include <faiss/cppcontrib/knowhere/utils/Bitset.h>
 #include <faiss/utils/Heap.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -3317,9 +3319,10 @@ GetGpuConstructionMutex() {
     return mtx;
 }
 
-// Single GPU HNSW index node that handles all CPU storage formats (F32, SQ8,
-// FP16, BF16) transparently. Uses faiss::gpu::GpuIndexHNSW for GPU search.
-// Accepts CPU-serialized HNSW or HNSW_SQ binaries at load time.
+// GPU HNSW index node. Registered for F32 and INT8 (see registrations at the
+// bottom of this file); it loads CPU-serialized HNSW (F32) or HNSW_SQ (SQ8/INT8)
+// binaries at load time and uploads them to the GPU via faiss::gpu::GpuIndexHNSW.
+// The CPU copy is freed after upload, so this node exposes no CPU raw data.
 class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
  public:
     GpuHnswIndexNode(const int32_t& version, const Object& object)
@@ -3333,7 +3336,10 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
 
     static bool
     StaticHasRawData(const knowhere::BaseConfig& config, const IndexVersion& version) {
-        return true;
+        // The CPU copy is freed after the GPU upload, so no CPU-reconstructable
+        // raw data is retained. Keep this consistent with the instance
+        // HasRawData() override below.
+        return false;
     }
 
     static expected<Resource>
@@ -3353,6 +3359,45 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     std::string
     Type() const override {
         return IndexEnum::INDEX_GPU_HNSW;
+    }
+
+    // After the eager GPU upload the CPU index (indexes[0]) is freed, so the
+    // inherited Count()/Dim()/HasRawData()/GetVectorByIds() would report an
+    // empty index. Serve vector count and dimension from the metadata captured
+    // before the CPU copy was released.
+    int64_t
+    Count() const override {
+        if (gpu_ready_.load(std::memory_order_acquire)) {
+            return gpu_ntotal_;
+        }
+        return BaseFaissRegularIndexHNSWNode::Count();
+    }
+
+    int64_t
+    Dim() const override {
+        if (gpu_ready_.load(std::memory_order_acquire)) {
+            return gpu_dim_;
+        }
+        return BaseFaissRegularIndexHNSWNode::Dim();
+    }
+
+    bool
+    HasRawData(const std::string& metric_type) const override {
+        // The CPU copy is freed after the GPU upload; GPU_HNSW does not expose
+        // CPU-reconstructable raw data (kept consistent with StaticHasRawData).
+        if (gpu_ready_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        return BaseFaissRegularIndexHNSWNode::HasRawData(metric_type);
+    }
+
+    expected<DataSetPtr>
+    GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* op_context) const override {
+        if (gpu_ready_.load(std::memory_order_acquire)) {
+            return expected<DataSetPtr>::Err(Status::not_implemented,
+                                             "GPU_HNSW keeps vectors on GPU; raw data retrieval is not supported");
+        }
+        return BaseFaissRegularIndexHNSWNode::GetVectorByIds(dataset, op_context);
     }
 
  protected:
@@ -3403,8 +3448,15 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                                                                             faiss_idx->metric_type);
                 }
                 gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
+                // Capture count/dim before releasing the CPU copy so Count()/
+                // Dim() keep working once indexes[0] is freed.
+                gpu_ntotal_ = faiss_idx->ntotal;
+                gpu_dim_ = faiss_idx->d;
                 // Release CPU copy — vectors and graph are now on GPU.
                 indexes[0].reset();
+                // Publish gpu_index_ with release semantics; the lock-free
+                // reader in Search() pairs this with an acquire load.
+                gpu_ready_.store(true, std::memory_order_release);
             } catch (const std::exception& e) {
                 fprintf(stderr, "[gpu_hnsw] eager GPU upload failed: %s\n", e.what());
                 gpu_index_.reset();
@@ -3416,14 +3468,19 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     expected<DataSetPtr>
     Search(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
            milvus::OpContext* op_context) const override {
-        if (!bitset.empty() && bitset.count() > 0) {
+        // GPU_HNSW does not apply the bitset, so reject any search that carries
+        // one. Guard on data()!=nullptr rather than count(), because count()
+        // defaults to 0 when the caller omits num_filtered_out_bits and would
+        // let a real filter slip through.
+        if (!bitset.empty() && bitset.data() != nullptr) {
             return expected<DataSetPtr>::Err(Status::invalid_args, "GPU_HNSW does not support filtered search");
         }
 
-        // Fast path: gpu_index_ is set during Deserialize and never cleared.
-        if (!gpu_index_) {
+        // Fast path: gpu_ready_ is published (release) once gpu_index_ is fully
+        // constructed; the acquire load here avoids a data race on the pointer.
+        if (!gpu_ready_.load(std::memory_order_acquire)) {
             std::unique_lock lock(gpu_mutex_);
-            if (!gpu_index_) {
+            if (!gpu_ready_.load(std::memory_order_relaxed)) {
                 const auto* faiss_idx = GetFaissHnswIndex();
                 if (!faiss_idx) {
                     return expected<DataSetPtr>::Err(Status::empty_index, "index not loaded");
@@ -3440,7 +3497,10 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                                                                                 faiss_idx->metric_type);
                     }
                     gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
+                    gpu_ntotal_ = faiss_idx->ntotal;
+                    gpu_dim_ = faiss_idx->d;
                     const_cast<std::shared_ptr<faiss::Index>&>(indexes[0]).reset();
+                    gpu_ready_.store(true, std::memory_order_release);
                 } catch (const std::exception& e) {
                     return expected<DataSetPtr>::Err(Status::cuvs_inner_error,
                                                      std::string("failed to build GPU HNSW index: ") + e.what());
@@ -3477,6 +3537,10 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         try {
             faiss::gpu::GpuHnswSearchParams gsp;
             gsp.ef = ef;
+            // Keep the overflow candidate queue enabled (matches
+            // SearchParametersGpuHNSW's default); leaving it 0 would disable
+            // the OCQ and reduce recall.
+            gsp.overflow_factor = 2;
             gpu_index_->searchHost(nq, h_queries, k, h_dist.get(), h_ids.get(), gsp);
         } catch (const std::exception& e) {
             LOG_KNOWHERE_ERROR_ << "GPU_HNSW search failed: " << e.what();
@@ -3508,6 +3572,12 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     mutable std::mutex gpu_mutex_;
     mutable std::shared_ptr<faiss::gpu::StandardGpuResources> gpu_resources_;
     mutable std::unique_ptr<faiss::gpu::GpuIndexHNSW> gpu_index_;
+    // Published (release) after gpu_index_ is fully built; read lock-free
+    // (acquire) on the search fast path and by Count()/Dim()/HasRawData().
+    mutable std::atomic<bool> gpu_ready_{false};
+    // Vector count/dim captured before the CPU copy is freed.
+    int64_t gpu_ntotal_ = 0;
+    int64_t gpu_dim_ = 0;
 };
 
 // Register GPU_HNSW in the static config map at process startup.
