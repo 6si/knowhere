@@ -3416,7 +3416,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         Status status;
         if (!binset.Contains(IndexEnum::INDEX_GPU_HNSW)) {
             BinarySet aliased = binset;
-            for (const char* key : {IndexEnum::INDEX_HNSW_SQ, IndexEnum::INDEX_HNSW}) {
+            for (const char* key : {IndexEnum::INDEX_GPU_HNSW_SQ, IndexEnum::INDEX_HNSW_SQ, IndexEnum::INDEX_HNSW}) {
                 if (binset.Contains(key)) {
                     aliased.Append(IndexEnum::INDEX_GPU_HNSW, binset.GetByName(key));
                     break;
@@ -3577,11 +3577,28 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     mutable int64_t gpu_dim_ = 0;
 };
 
-// Register GPU_HNSW in the static config map at process startup.
+// GPU_HNSW_SQ is an alias of GPU_HNSW: the GPU search path is identical (a
+// CPU-built HNSW/HNSW_SQ index uploaded to GpuIndexHNSW), so it reuses
+// GpuHnswIndexNode and only reports a distinct Type() so Milvus's configured
+// index_type matches the loaded node.
+class GpuHnswSQIndexNode : public GpuHnswIndexNode {
+ public:
+    GpuHnswSQIndexNode(const int32_t& version, const Object& object) : GpuHnswIndexNode(version, object) {
+    }
+
+    std::string
+    Type() const override {
+        return IndexEnum::INDEX_GPU_HNSW_SQ;
+    }
+};
+
+// Register GPU_HNSW / GPU_HNSW_SQ in the static config map at process startup.
 __attribute__((constructor)) static void
 register_gpu_hnsw_static_config() {
     IndexStaticFaced<fp32>::Instance().RegisterStaticFunc<GpuHnswIndexNode>(IndexEnum::INDEX_GPU_HNSW);
     IndexStaticFaced<int8>::Instance().RegisterStaticFunc<GpuHnswIndexNode>(IndexEnum::INDEX_GPU_HNSW);
+    IndexStaticFaced<fp32>::Instance().RegisterStaticFunc<GpuHnswSQIndexNode>(IndexEnum::INDEX_GPU_HNSW_SQ);
+    IndexStaticFaced<int8>::Instance().RegisterStaticFunc<GpuHnswSQIndexNode>(IndexEnum::INDEX_GPU_HNSW_SQ);
 }
 
 KNOWHERE_REGISTER_GLOBAL(
@@ -3593,6 +3610,18 @@ KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<int8>>::Create(std::make_unique<GpuHnswIndexNode>(version, object));
+    },
+    int8, true, (feature::INT8 | feature::GPU));
+
+KNOWHERE_REGISTER_GLOBAL(
+    GPU_HNSW_SQ,
+    [](const int32_t& version, const Object& object) { return Index<GpuHnswSQIndexNode>::Create(version, object); },
+    fp32, true, feature::GPU_ANN_FLOAT_INDEX);
+
+KNOWHERE_REGISTER_GLOBAL(
+    GPU_HNSW_SQ,
+    [](const int32_t& version, const Object& object) {
+        return Index<IndexNodeDataMockWrapper<int8>>::Create(std::make_unique<GpuHnswSQIndexNode>(version, object));
     },
     int8, true, (feature::INT8 | feature::GPU));
 #endif  // KNOWHERE_WITH_CUVS
