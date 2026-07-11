@@ -3537,10 +3537,6 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         try {
             faiss::gpu::GpuHnswSearchParams gsp;
             gsp.ef = ef;
-            // Keep the overflow candidate queue enabled (matches
-            // SearchParametersGpuHNSW's default); leaving it 0 would disable
-            // the OCQ and reduce recall.
-            gsp.overflow_factor = 2;
             gpu_index_->searchHost(nq, h_queries, k, h_dist.get(), h_ids.get(), gsp);
         } catch (const std::exception& e) {
             LOG_KNOWHERE_ERROR_ << "GPU_HNSW search failed: " << e.what();
