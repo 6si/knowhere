@@ -643,6 +643,86 @@ TEST_CASE("Test All GPU Index", "[search]") {
         // SQ8 has lower recall than flat due to quantization
         REQUIRE(recall >= 0.7f);
     }
+
+    SECTION("Test GPU HNSW FP16 Deserialization") {
+        // Build a CPU HNSW (fp16 -> HNSW_SQ QT_fp16 storage), then load and
+        // search on GPU. fp16 vectors stay in their native 2-byte layout on the
+        // device and are up-converted to fp32 per element in the search kernel.
+        knowhere::Json hnsw_json;
+        hnsw_json[knowhere::meta::DIM] = dim;
+        hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+        hnsw_json[knowhere::meta::TOPK] = 1;
+        hnsw_json[knowhere::indexparam::HNSW_M] = 16;
+        hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+        hnsw_json[knowhere::indexparam::EF] = 200;
+
+        auto train_ds = knowhere::ConvertToDataTypeIfNeeded<knowhere::fp16>(GenDataSet(nb, dim, seed));
+        auto query_ds = knowhere::ConvertToDataTypeIfNeeded<knowhere::fp16>(GenDataSet(nq, dim, seed + 2));
+
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp16>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        auto res = cpu_idx.Build(train_ds, hnsw_json);
+        REQUIRE(res == knowhere::Status::success);
+
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp16>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        auto deser_res = gpu_idx.Deserialize(bs);
+        REQUIRE(deser_res == knowhere::Status::success);
+
+        auto results = gpu_idx.Search(query_ds, hnsw_json, nullptr);
+        REQUIRE(results.has_value());
+
+        auto gt = knowhere::BruteForce::Search<knowhere::fp16>(train_ds, query_ds, hnsw_json, nullptr);
+        REQUIRE(gt.has_value());
+        float recall = GetKNNRecall(*gt.value(), *results.value());
+        // fp16 is near-lossless (10-bit mantissa); recall should stay close to
+        // the fp32 flat path.
+        REQUIRE(recall >= 0.9f);
+    }
+
+    SECTION("Test GPU HNSW BF16 Deserialization") {
+        // Build a CPU HNSW (bf16 -> HNSW_SQ QT_bf16 storage), then load and
+        // search on GPU. bf16 vectors stay in their native 2-byte layout on the
+        // device and are up-converted to fp32 per element in the search kernel.
+        knowhere::Json hnsw_json;
+        hnsw_json[knowhere::meta::DIM] = dim;
+        hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+        hnsw_json[knowhere::meta::TOPK] = 1;
+        hnsw_json[knowhere::indexparam::HNSW_M] = 16;
+        hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+        hnsw_json[knowhere::indexparam::EF] = 200;
+
+        auto train_ds = knowhere::ConvertToDataTypeIfNeeded<knowhere::bf16>(GenDataSet(nb, dim, seed));
+        auto query_ds = knowhere::ConvertToDataTypeIfNeeded<knowhere::bf16>(GenDataSet(nq, dim, seed + 2));
+
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::bf16>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        auto res = cpu_idx.Build(train_ds, hnsw_json);
+        REQUIRE(res == knowhere::Status::success);
+
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::bf16>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        auto deser_res = gpu_idx.Deserialize(bs);
+        REQUIRE(deser_res == knowhere::Status::success);
+
+        auto results = gpu_idx.Search(query_ds, hnsw_json, nullptr);
+        REQUIRE(results.has_value());
+
+        auto gt = knowhere::BruteForce::Search<knowhere::bf16>(train_ds, query_ds, hnsw_json, nullptr);
+        REQUIRE(gt.has_value());
+        float recall = GetKNNRecall(*gt.value(), *results.value());
+        // bf16 has a 7-bit mantissa (coarser than fp16) but a wide exponent;
+        // recall stays high but with a slightly looser floor.
+        REQUIRE(recall >= 0.85f);
+    }
 }
 
 TEST_CASE("Test CPU vs GPU HNSW Comparison", "[gpu_hnsw_compare]") {

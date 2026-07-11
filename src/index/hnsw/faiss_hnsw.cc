@@ -3319,10 +3319,13 @@ GetGpuConstructionMutex() {
     return mtx;
 }
 
-// GPU HNSW index node. Registered for F32 and INT8 (see registrations at the
-// bottom of this file); it loads CPU-serialized HNSW (F32) or HNSW_SQ (SQ8/INT8)
-// binaries at load time and uploads them to the GPU via faiss::gpu::GpuIndexHNSW.
-// The CPU copy is freed after upload, so this node exposes no CPU raw data.
+// GPU HNSW index node. Registered for F32, FP16, BF16 and INT8 (see
+// registrations at the bottom of this file); it loads CPU-serialized HNSW (F32
+// Flat) or HNSW_SQ (SQ8/INT8, fp16, bf16) binaries at load time and uploads them
+// to the GPU via faiss::gpu::GpuIndexHNSW. FP16/BF16/INT8 stay in their native
+// low-precision layout on the device (2 bytes for fp16/bf16, 1 byte for int8)
+// and are up-converted to fp32 per element inside the search kernel. The CPU
+// copy is freed after upload, so this node exposes no CPU raw data.
 class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
  public:
     GpuHnswIndexNode(const int32_t& version, const Object& object)
@@ -3596,8 +3599,12 @@ class GpuHnswSQIndexNode : public GpuHnswIndexNode {
 __attribute__((constructor)) static void
 register_gpu_hnsw_static_config() {
     IndexStaticFaced<fp32>::Instance().RegisterStaticFunc<GpuHnswIndexNode>(IndexEnum::INDEX_GPU_HNSW);
+    IndexStaticFaced<fp16>::Instance().RegisterStaticFunc<GpuHnswIndexNode>(IndexEnum::INDEX_GPU_HNSW);
+    IndexStaticFaced<bf16>::Instance().RegisterStaticFunc<GpuHnswIndexNode>(IndexEnum::INDEX_GPU_HNSW);
     IndexStaticFaced<int8>::Instance().RegisterStaticFunc<GpuHnswIndexNode>(IndexEnum::INDEX_GPU_HNSW);
     IndexStaticFaced<fp32>::Instance().RegisterStaticFunc<GpuHnswSQIndexNode>(IndexEnum::INDEX_GPU_HNSW_SQ);
+    IndexStaticFaced<fp16>::Instance().RegisterStaticFunc<GpuHnswSQIndexNode>(IndexEnum::INDEX_GPU_HNSW_SQ);
+    IndexStaticFaced<bf16>::Instance().RegisterStaticFunc<GpuHnswSQIndexNode>(IndexEnum::INDEX_GPU_HNSW_SQ);
     IndexStaticFaced<int8>::Instance().RegisterStaticFunc<GpuHnswSQIndexNode>(IndexEnum::INDEX_GPU_HNSW_SQ);
 }
 
@@ -3605,6 +3612,20 @@ KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) { return Index<GpuHnswIndexNode>::Create(version, object); }, fp32,
     true, feature::GPU_ANN_FLOAT_INDEX);
+
+KNOWHERE_REGISTER_GLOBAL(
+    GPU_HNSW,
+    [](const int32_t& version, const Object& object) {
+        return Index<IndexNodeDataMockWrapper<fp16>>::Create(std::make_unique<GpuHnswIndexNode>(version, object));
+    },
+    fp16, true, (feature::FP16 | feature::GPU));
+
+KNOWHERE_REGISTER_GLOBAL(
+    GPU_HNSW,
+    [](const int32_t& version, const Object& object) {
+        return Index<IndexNodeDataMockWrapper<bf16>>::Create(std::make_unique<GpuHnswIndexNode>(version, object));
+    },
+    bf16, true, (feature::BF16 | feature::GPU));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
@@ -3617,6 +3638,20 @@ KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
     [](const int32_t& version, const Object& object) { return Index<GpuHnswSQIndexNode>::Create(version, object); },
     fp32, true, feature::GPU_ANN_FLOAT_INDEX);
+
+KNOWHERE_REGISTER_GLOBAL(
+    GPU_HNSW_SQ,
+    [](const int32_t& version, const Object& object) {
+        return Index<IndexNodeDataMockWrapper<fp16>>::Create(std::make_unique<GpuHnswSQIndexNode>(version, object));
+    },
+    fp16, true, (feature::FP16 | feature::GPU));
+
+KNOWHERE_REGISTER_GLOBAL(
+    GPU_HNSW_SQ,
+    [](const int32_t& version, const Object& object) {
+        return Index<IndexNodeDataMockWrapper<bf16>>::Create(std::make_unique<GpuHnswSQIndexNode>(version, object));
+    },
+    bf16, true, (feature::BF16 | feature::GPU));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
