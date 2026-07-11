@@ -3298,6 +3298,15 @@ namespace knowhere {  // reopen namespace knowhere
 // Process-global StandardGpuResources shared by all GpuHnswIndexNode instances.
 // Avoids per-segment 256 MiB pinned memory, cuBLAS handle, and CUDA stream
 // allocations that accumulate to tens of GiB with many segments.
+//
+// Device model: this assumes a single visible GPU per process, which is how
+// Milvus GPU querynodes are deployed (one device pinned via CUDA_VISIBLE_DEVICES
+// / MIG). GpuIndexHNSW below is constructed with the default device (0), so all
+// segments in a process land on that one GPU. StandardGpuResources can manage
+// multiple devices, but true multi-GPU-per-process would additionally require
+// explicit per-segment device selection in the GpuIndexHNSW config; that is a
+// follow-up and is intentionally not wired here (cannot be validated without
+// multi-GPU capacity).
 static std::shared_ptr<faiss::gpu::StandardGpuResources>&
 GetSharedGpuResources() {
     static std::once_flag flag;
@@ -3413,6 +3422,11 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     Status
     Deserialize(const BinarySet& binset, std::shared_ptr<Config> cfg) override {
         std::unique_lock lock(gpu_mutex_);
+        // Unpublish before tearing down: on a reload a stale gpu_ready_==true
+        // combined with a reset (or failed re-upload of) gpu_index_ would let the
+        // lock-free reader in Search() dereference a null index. Clear it under
+        // the same lock so a failed re-upload leaves the node honestly "not ready".
+        gpu_ready_.store(false, std::memory_order_release);
         gpu_index_.reset();
 
         // Accept CPU-built HNSW (F32) or HNSW_SQ (quantized) binaries.

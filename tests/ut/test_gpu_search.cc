@@ -592,16 +592,18 @@ TEST_CASE("Test All GPU Index", "[search]") {
         auto deser_res = gpu_idx.Deserialize(bs);
         REQUIRE(deser_res == knowhere::Status::success);
 
-        // Self-search: each vector should find itself as nearest neighbor
+        // Self-search: each vector should find itself as nearest neighbor.
+        // The query set is train_ds (nb rows), so check all nb results — using
+        // nq only exercised the first nq of nb vectors.
         auto results = gpu_idx.Search(train_ds, hnsw_json, nullptr);
         REQUIRE(results.has_value());
         auto ids = results.value()->GetIds();
         int correct = 0;
-        for (int i = 0; i < nq; ++i) {
+        for (int i = 0; i < nb; ++i) {
             if (ids[i] == i)
                 correct++;
         }
-        float self_recall = static_cast<float>(correct) / nq;
+        float self_recall = static_cast<float>(correct) / nb;
         REQUIRE(self_recall >= 0.95f);
     }
 
