@@ -3575,9 +3575,10 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     // Published (release) after gpu_index_ is fully built; read lock-free
     // (acquire) on the search fast path and by Count()/Dim()/HasRawData().
     mutable std::atomic<bool> gpu_ready_{false};
-    // Vector count/dim captured before the CPU copy is freed.
-    int64_t gpu_ntotal_ = 0;
-    int64_t gpu_dim_ = 0;
+    // Vector count/dim captured before the CPU copy is freed (written from the
+    // const lazy-upload path in Search(), hence mutable).
+    mutable int64_t gpu_ntotal_ = 0;
+    mutable int64_t gpu_dim_ = 0;
 };
 
 // Register GPU_HNSW in the static config map at process startup.
