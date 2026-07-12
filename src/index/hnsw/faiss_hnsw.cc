@@ -3357,55 +3357,34 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     static expected<Resource>
     StaticEstimateLoadResource(const uint64_t file_size_in_bytes, const int64_t num_rows, const int64_t dim,
                                const knowhere::BaseConfig& config, const IndexVersion& version) {
-        // GPU HNSW stores vectors and graph in VRAM; the CPU copy is freed after
-        // upload in Deserialize()/DeserializeFromFile(). Phase-separated accounting:
+        // GPU HNSW stores the vectors and graph in VRAM; the CPU copy is freed
+        // after upload in Deserialize()/DeserializeFromFile(). Phase-separated
+        // accounting:
         //   memoryCost (retained after load): ~0 — the CPU index is released
-        //     once the graph/vectors are on the GPU.
-        //   maxMemoryCost (transient peak during load): the loader must reserve
-        //     enough host RAM to cover the simultaneously-live buffers before the
-        //     GPU upload frees the CPU copy:
-        //       - the serialized download buffer          (~file_size),
-        //       - the resident fp32 vectors               (num_rows*dim*4),
-        //       - the resident hnswlib graph lists        (num_rows*M*2*4),
-        //       - fp32 decode staging for the upload      (num_rows*dim*4).
-        // The on-disk file_size is NOT a proxy for the resident index: hnswlib
-        // materializes vectors as fp32 inline (dim*4 per node) even when the
-        // stored form is compressed (e.g. int8), so the deserialized index is
-        // several times the file. copyFromWithMetric() then reconstructs a
-        // separate fp32 staging buffer before the host->device copy. Under-
-        // counting this peak lets the loader admit too many concurrent uploads
-        // and OOMs the host cgroup before any upload completes.
-        const uint64_t rows = num_rows > 0 ? static_cast<uint64_t>(num_rows) : 0;
-        const uint64_t d = dim > 0 ? static_cast<uint64_t>(dim) : 0;
+        //     once the graph/vectors are on the GPU, so a loaded segment holds
+        //     no steady-state host RAM (its data lives in VRAM).
+        //   maxMemoryCost (transient peak during load): the host RAM that is
+        //     briefly live before the GPU upload frees the CPU copy.
+        //
+        // The on-disk index for this collection is the compact FAISS int8-SQ
+        // form (IndexHNSWSQCosine: signed-int8 codes + graph), the SAME form the
+        // CPU HNSW cluster loads resident at ~file_size. Deserialize reads it
+        // into host RAM at ~file_size (no fp32 expansion — the int8 codes are
+        // uploaded to the device directly, so there is NO fp32 reconstruct/decode
+        // staging on this path). The transient peak is therefore dominated by the
+        // serialized read buffer plus the deserialized compact index, ~2x the
+        // on-disk file size — not the fp32 rows*dim*4 blowup that a Flat/hnswlib
+        // path would incur. Basing the estimate on file_size also avoids relying
+        // on num_rows/dim, which can arrive as 0 at estimate time.
+        (void)num_rows;
+        (void)dim;
+        (void)config;
+        (void)version;
 
-        // hnsw connectivity: read the train-time M when the load config carries
-        // it; otherwise fall back to a conservative value (over-reserving the
-        // graph term is safe for admission control).
-        uint64_t m = 32;
-        if (const auto* hnsw_cfg = dynamic_cast<const BaseHnswConfig*>(&config)) {
-            if (hnsw_cfg->M.has_value()) {
-                m = static_cast<uint64_t>(hnsw_cfg->M.value());
-            }
-        }
+        const uint64_t peak = file_size_in_bytes * 2;
 
-        const uint64_t resident_vectors = rows * d * sizeof(float);
-        const uint64_t resident_graph = rows * m * 2 * sizeof(int32_t);
-        const uint64_t decode_staging = rows * d * sizeof(float);
-        uint64_t peak = file_size_in_bytes + resident_vectors + resident_graph + decode_staging;
-
-        if (rows == 0 || d == 0) {
-            // Row/dim metadata is unavailable at estimate time (num_rows can
-            // arrive as 0 from the load info). rows*dim*4 collapses to 0 and the
-            // estimate degenerates to ~file_size, grossly under-reserving the
-            // fp32-expanded peak. Guard with a conservative multiple of the file
-            // size so admission still throttles concurrent GPU uploads.
-            LOG_KNOWHERE_WARNING_ << "GPU_HNSW load estimate missing row/dim metadata (num_rows=" << num_rows
-                                  << ", dim=" << dim << "); falling back to file-size-based peak";
-            const uint64_t fallback = file_size_in_bytes * 9;
-            if (peak < fallback) {
-                peak = fallback;
-            }
-        }
+        LOG_KNOWHERE_INFO_ << "GPU_HNSW load estimate (compact int8): file_size=" << file_size_in_bytes
+                           << " transient_peak=" << peak << " retained=0";
 
         return Resource{.memoryCost = 0, .diskCost = 0, .maxMemoryCost = peak};
     }
