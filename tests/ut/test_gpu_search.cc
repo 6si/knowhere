@@ -526,7 +526,9 @@ TEST_CASE("Test All GPU Index", "[search]") {
         auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, hnsw_json, nullptr);
         REQUIRE(gt.has_value());
         float recall = GetKNNRecall(*gt.value(), *results.value());
-        REQUIRE(recall >= 0.65f);
+        // GPU HNSW cosine recall tracks L2 (measured ~0.98 on L40S); keep the
+        // floor in line with the L2/IP sections so real regressions are caught.
+        REQUIRE(recall >= 0.80f);
     }
 
     SECTION("Test GPU HNSW Search TopK") {
