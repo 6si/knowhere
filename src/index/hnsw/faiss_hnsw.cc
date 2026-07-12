@@ -3358,19 +3358,55 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     StaticEstimateLoadResource(const uint64_t file_size_in_bytes, const int64_t num_rows, const int64_t dim,
                                const knowhere::BaseConfig& config, const IndexVersion& version) {
         // GPU HNSW stores vectors and graph in VRAM; the CPU copy is freed after
-        // upload in Deserialize(). Phase-separated accounting:
+        // upload in Deserialize()/DeserializeFromFile(). Phase-separated accounting:
         //   memoryCost (retained after load): ~0 — the CPU index is released
         //     once the graph/vectors are on the GPU.
         //   maxMemoryCost (transient peak during load): the loader must reserve
         //     enough host RAM to cover the simultaneously-live buffers before the
         //     GPU upload frees the CPU copy:
-        //       - the serialized download buffer (~file_size),
-        //       - the deserialized CPU HNSW index: vectors + graph (~file_size),
-        //       - fp32 decode/graph staging for the upload (num_rows*dim*4).
+        //       - the serialized download buffer          (~file_size),
+        //       - the resident fp32 vectors               (num_rows*dim*4),
+        //       - the resident hnswlib graph lists        (num_rows*M*2*4),
+        //       - fp32 decode staging for the upload      (num_rows*dim*4).
+        // The on-disk file_size is NOT a proxy for the resident index: hnswlib
+        // materializes vectors as fp32 inline (dim*4 per node) even when the
+        // stored form is compressed (e.g. int8), so the deserialized index is
+        // several times the file. copyFromWithMetric() then reconstructs a
+        // separate fp32 staging buffer before the host->device copy. Under-
+        // counting this peak lets the loader admit too many concurrent uploads
+        // and OOMs the host cgroup before any upload completes.
         const uint64_t rows = num_rows > 0 ? static_cast<uint64_t>(num_rows) : 0;
         const uint64_t d = dim > 0 ? static_cast<uint64_t>(dim) : 0;
+
+        // hnsw connectivity: read the train-time M when the load config carries
+        // it; otherwise fall back to a conservative value (over-reserving the
+        // graph term is safe for admission control).
+        uint64_t m = 32;
+        if (const auto* hnsw_cfg = dynamic_cast<const BaseHnswConfig*>(&config)) {
+            if (hnsw_cfg->M.has_value()) {
+                m = static_cast<uint64_t>(hnsw_cfg->M.value());
+            }
+        }
+
+        const uint64_t resident_vectors = rows * d * sizeof(float);
+        const uint64_t resident_graph = rows * m * 2 * sizeof(int32_t);
         const uint64_t decode_staging = rows * d * sizeof(float);
-        const uint64_t peak = file_size_in_bytes + file_size_in_bytes + decode_staging;
+        uint64_t peak = file_size_in_bytes + resident_vectors + resident_graph + decode_staging;
+
+        if (rows == 0 || d == 0) {
+            // Row/dim metadata is unavailable at estimate time (num_rows can
+            // arrive as 0 from the load info). rows*dim*4 collapses to 0 and the
+            // estimate degenerates to ~file_size, grossly under-reserving the
+            // fp32-expanded peak. Guard with a conservative multiple of the file
+            // size so admission still throttles concurrent GPU uploads.
+            LOG_KNOWHERE_WARNING_ << "GPU_HNSW load estimate missing row/dim metadata (num_rows=" << num_rows
+                                  << ", dim=" << dim << "); falling back to file-size-based peak";
+            const uint64_t fallback = file_size_in_bytes * 9;
+            if (peak < fallback) {
+                peak = fallback;
+            }
+        }
+
         return Resource{.memoryCost = 0, .diskCost = 0, .maxMemoryCost = peak};
     }
 
@@ -3695,57 +3731,64 @@ register_gpu_hnsw_static_config() {
     IndexStaticFaced<int8>::Instance().RegisterStaticFunc<GpuHnswSQIndexNode>(IndexEnum::INDEX_GPU_HNSW_SQ);
 }
 
+// NOTE: feature::MMAP is intentionally set. Although GPU_HNSW ultimately holds
+// its vectors/graph in VRAM (the CPU copy is freed after upload), the CPU index
+// is deserialized via the mmap-capable file path during load. Advertising MMAP
+// lets Milvus keep enableMmap=true so the transient CPU HNSW is file-backed
+// rather than anonymous host RAM before the GPU upload frees it -- without this,
+// the override HNSW->GPU_HNSW silently disables mmap and the full fp32-expanded
+// index lands in anon RAM (the post-override host OOM regression).
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) { return Index<GpuHnswIndexNode>::Create(version, object); }, fp32,
-    true, feature::GPU_ANN_FLOAT_INDEX);
+    true, (feature::GPU_ANN_FLOAT_INDEX | feature::MMAP));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<fp16>>::Create(std::make_unique<GpuHnswIndexNode>(version, object));
     },
-    fp16, true, (feature::FP16 | feature::GPU));
+    fp16, true, (feature::FP16 | feature::GPU | feature::MMAP));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<bf16>>::Create(std::make_unique<GpuHnswIndexNode>(version, object));
     },
-    bf16, true, (feature::BF16 | feature::GPU));
+    bf16, true, (feature::BF16 | feature::GPU | feature::MMAP));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<int8>>::Create(std::make_unique<GpuHnswIndexNode>(version, object));
     },
-    int8, true, (feature::INT8 | feature::GPU));
+    int8, true, (feature::INT8 | feature::GPU | feature::MMAP));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
     [](const int32_t& version, const Object& object) { return Index<GpuHnswSQIndexNode>::Create(version, object); },
-    fp32, true, feature::GPU_ANN_FLOAT_INDEX);
+    fp32, true, (feature::GPU_ANN_FLOAT_INDEX | feature::MMAP));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<fp16>>::Create(std::make_unique<GpuHnswSQIndexNode>(version, object));
     },
-    fp16, true, (feature::FP16 | feature::GPU));
+    fp16, true, (feature::FP16 | feature::GPU | feature::MMAP));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<bf16>>::Create(std::make_unique<GpuHnswSQIndexNode>(version, object));
     },
-    bf16, true, (feature::BF16 | feature::GPU));
+    bf16, true, (feature::BF16 | feature::GPU | feature::MMAP));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<int8>>::Create(std::make_unique<GpuHnswSQIndexNode>(version, object));
     },
-    int8, true, (feature::INT8 | feature::GPU));
+    int8, true, (feature::INT8 | feature::GPU | feature::MMAP));
 #endif  // KNOWHERE_WITH_CUVS
 
 }  // namespace knowhere

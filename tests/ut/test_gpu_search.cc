@@ -1309,10 +1309,36 @@ TEST_CASE("Test GPU HNSW Codex P1 Regressions", "[gpu_hnsw_p1]") {
         REQUIRE(gpu_res.value().memoryCost == 0);
         REQUIRE(gpu_res.value().diskCost == 0);
         // Transient peak is non-zero and at least covers the fp32 decode staging
-        // plus the download buffer (2*file_size + rows*dim*4 in the estimator).
+        // plus the download buffer.
         REQUIRE(gpu_res.value().maxMemoryCost > 0);
         const uint64_t decode_staging = static_cast<uint64_t>(nb) * dim * sizeof(float);
         REQUIRE(gpu_res.value().maxMemoryCost >= file_size + decode_staging);
+
+        // The estimate must be driven by the fp32-expanded resident index, NOT
+        // by the on-disk file size. A compressed (e.g. int8) index stores far
+        // fewer bytes on disk than the fp32 graph hnswlib materializes in host
+        // RAM, so the peak has to cover num_rows*dim*4 (resident vectors) +
+        // num_rows*dim*4 (decode staging) independent of file_size. Simulate an
+        // int8-sized file (1 byte/element) and assert the peak still reflects
+        // the fp32 in-memory footprint (this is the production OOM regression:
+        // an ~file_size-tracking estimate under-reserves and OOMs the host).
+        const uint64_t int8_file = static_cast<uint64_t>(nb) * dim * sizeof(int8_t);
+        auto compressed_res = knowhere::IndexStaticFaced<knowhere::fp32>::EstimateLoadResource(
+            knowhere::IndexEnum::INDEX_GPU_HNSW, version, int8_file, nb, dim, params);
+        REQUIRE(compressed_res.has_value());
+        const uint64_t fp32_resident_plus_staging = 2 * static_cast<uint64_t>(nb) * dim * sizeof(float);
+        REQUIRE(compressed_res.value().maxMemoryCost >= fp32_resident_plus_staging);
+        // And it must dwarf the naive 2*file_size an ~file-tracking estimate
+        // would have produced.
+        REQUIRE(compressed_res.value().maxMemoryCost > 2 * int8_file);
+
+        // When row/dim metadata is missing (num_rows arrives as 0 from the load
+        // info), the rows*dim terms vanish; the estimate must not collapse to
+        // ~file_size but fall back to a conservative multiple of it.
+        auto norows_res = knowhere::IndexStaticFaced<knowhere::fp32>::EstimateLoadResource(
+            knowhere::IndexEnum::INDEX_GPU_HNSW, version, int8_file, 0, dim, params);
+        REQUIRE(norows_res.has_value());
+        REQUIRE(norows_res.value().maxMemoryCost >= int8_file * 9);
 
         // A plain CPU HNSW keeps its data resident: memoryCost is non-zero and it
         // does not opt into the peak field (maxMemoryCost stays 0 -> Milvus falls

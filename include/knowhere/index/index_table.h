@@ -167,6 +167,12 @@ static std::set<std::string> legal_support_mmap_knowhere_index = {
     IndexEnum::INDEX_HNSW_PQ,
     IndexEnum::INDEX_HNSW_PRQ,
 
+    // gpu hnsw: the CPU index is deserialized via the mmap-capable file path
+    // during load (the vectors/graph then move to VRAM and the CPU copy is
+    // freed), so the transient CPU index can be file-backed rather than anon.
+    IndexEnum::INDEX_GPU_HNSW,
+    IndexEnum::INDEX_GPU_HNSW_SQ,
+
     // sparse index
     IndexEnum::INDEX_SPARSE_INVERTED_INDEX,
     IndexEnum::INDEX_SPARSE_WAND,
