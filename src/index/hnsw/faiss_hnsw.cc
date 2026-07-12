@@ -3438,7 +3438,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         // lock-free reader in Search() dereference a null index. Clear it under
         // the same lock so a failed re-upload leaves the node honestly "not ready".
         gpu_ready_.store(false, std::memory_order_release);
-        gpu_index_.store(nullptr, std::memory_order_release);
+        gpu_index_ = nullptr;
 
         // Accept CPU-built HNSW (F32) or HNSW_SQ (quantized) binaries.
         Status status;
@@ -3483,9 +3483,10 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                 gpu_dim_ = faiss_idx->d;
                 // Release CPU copy — vectors and graph are now on GPU.
                 indexes[0].reset();
-                // Publish the fully-built index (release); Search() takes an
-                // acquire snapshot. gpu_ready_ is published last for Count()/Dim().
-                gpu_index_.store(local, std::memory_order_release);
+                // Publish the fully-built index under gpu_mutex_ (held for this
+                // whole method); Search() takes a locked snapshot. gpu_ready_ is
+                // published last for the lock-free Count()/Dim() readers.
+                gpu_index_ = local;
                 gpu_ready_.store(true, std::memory_order_release);
             } catch (const std::exception& e) {
                 // Fail the load rather than reporting success with no GPU index:
@@ -3493,7 +3494,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                 // first search. Leave the member null so gpu_ready_ stays false
                 // and return an error so the caller treats the load as failed.
                 LOG_KNOWHERE_ERROR_ << "eager GPU upload failed: " << e.what();
-                gpu_index_.store(nullptr, std::memory_order_release);
+                gpu_index_ = nullptr;
                 return Status::cuda_runtime_error;
             }
         }
@@ -3511,14 +3512,20 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
             return expected<DataSetPtr>::Err(Status::invalid_args, "GPU_HNSW does not support filtered search");
         }
 
-        // Take a shared-ownership snapshot of the GPU index up front. It keeps
-        // the index alive for the whole search even if a concurrent
-        // Deserialize() reload resets/rebuilds gpu_index_; a bare atomic
-        // readiness flag would guarantee visibility but not lifetime.
-        std::shared_ptr<faiss::gpu::GpuIndexHNSW> gpu_snapshot = gpu_index_.load(std::memory_order_acquire);
+        // Take a shared-ownership snapshot of the GPU index under gpu_mutex_. The
+        // snapshot keeps the index alive for the whole search even if a concurrent
+        // Deserialize() reload resets/rebuilds gpu_index_; the lock is held only
+        // for the pointer copy, not the search itself. (std::atomic<shared_ptr>
+        // is C++20/libstdc++-12 only, so guard the plain shared_ptr with the
+        // existing mutex instead.)
+        std::shared_ptr<faiss::gpu::GpuIndexHNSW> gpu_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(gpu_mutex_);
+            gpu_snapshot = gpu_index_;
+        }
         if (!gpu_snapshot) {
-            std::unique_lock lock(gpu_mutex_);
-            gpu_snapshot = gpu_index_.load(std::memory_order_relaxed);
+            std::unique_lock<std::mutex> lock(gpu_mutex_);
+            gpu_snapshot = gpu_index_;
             if (!gpu_snapshot) {
                 const auto* faiss_idx = GetFaissHnswIndex();
                 if (!faiss_idx) {
@@ -3540,7 +3547,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                     gpu_ntotal_ = faiss_idx->ntotal;
                     gpu_dim_ = faiss_idx->d;
                     const_cast<std::shared_ptr<faiss::Index>&>(indexes[0]).reset();
-                    gpu_index_.store(local, std::memory_order_release);
+                    gpu_index_ = local;
                     gpu_ready_.store(true, std::memory_order_release);
                     gpu_snapshot = local;
                 } catch (const std::exception& e) {
@@ -3609,12 +3616,13 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
 
     mutable std::mutex gpu_mutex_;
     mutable std::shared_ptr<faiss::gpu::StandardGpuResources> gpu_resources_;
-    // Held as an atomic shared_ptr so Search() can take a shared-ownership
-    // snapshot that keeps the GPU index alive for the entire search even if a
-    // concurrent Deserialize() reload resets/rebuilds the member. Atomic
-    // readiness (gpu_ready_) only guarantees visibility, not lifetime, so a
-    // bare pointer read on the search fast path would be a use-after-free.
-    mutable std::atomic<std::shared_ptr<faiss::gpu::GpuIndexHNSW>> gpu_index_;
+    // Guarded by gpu_mutex_. Search() copies this into a local shared_ptr under
+    // the lock so the GPU index stays alive for the entire (unlocked) search even
+    // if a concurrent Deserialize() reload resets/rebuilds the member. A bare
+    // pointer read on the search fast path would be a use-after-free, and
+    // std::atomic<std::shared_ptr> is C++20/libstdc++-12 only (the build
+    // toolchain is GCC 11), so the mutex-guarded snapshot is used instead.
+    mutable std::shared_ptr<faiss::gpu::GpuIndexHNSW> gpu_index_;
     // Published (release) after gpu_index_ is fully built; read lock-free
     // (acquire) by Count()/Dim()/HasRawData()/GetVectorByIds().
     mutable std::atomic<bool> gpu_ready_{false};
