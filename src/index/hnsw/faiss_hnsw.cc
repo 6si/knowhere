@@ -3475,8 +3475,13 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                 // reader in Search() pairs this with an acquire load.
                 gpu_ready_.store(true, std::memory_order_release);
             } catch (const std::exception& e) {
-                fprintf(stderr, "[gpu_hnsw] eager GPU upload failed: %s\n", e.what());
+                // Fail the load rather than reporting success with no GPU index:
+                // a silently "loaded" segment would only surface the error on the
+                // first search. Reset so gpu_ready_ stays false and return an error
+                // status so the caller treats the segment as failed to load.
+                LOG_KNOWHERE_ERROR_ << "eager GPU upload failed: " << e.what();
                 gpu_index_.reset();
+                return Status::cuda_runtime_error;
             }
         }
         return Status::success;
