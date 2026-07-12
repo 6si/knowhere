@@ -11,6 +11,8 @@
 
 #include <atomic>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1026,6 +1028,71 @@ TEST_CASE("Test GPU HNSW Codex P1 Regressions", "[gpu_hnsw_p1]") {
         // Lossy SQ paths; a conservative floor. fp16/bf16 are near-lossless, sq8
         // coarser.
         REQUIRE(recall >= (sq_type == "sq8" ? 0.65f : 0.85f));
+    }
+
+    // #4: Milvus loads sealed segments through the mmap/file path
+    // (VectorMemIndex::LoadFromFile -> DeserializeFromFile), NOT
+    // Deserialize(BinarySet). The eager GPU upload must fire on that path too;
+    // otherwise the CPU-built HNSW stays resident in host RAM and the GPU is
+    // never used. This was the root cause of the mpd_v2 querynode OOM: each
+    // segment's (fp32-expanded) CPU index — ~5.9 GiB — was retained in host
+    // anon memory instead of being uploaded to VRAM and freed, so ~14
+    // segments/pod overran the memory limit while VRAM stayed near-idle.
+    //
+    // The discriminating assertion is Size()==0 *before any search*: the eager
+    // upload releases indexes[0], so the base Size() (computed from indexes[0])
+    // is 0. Pre-fix, DeserializeFromFile skipped the upload and left the CPU
+    // copy resident, so Size() reported the full retained host footprint. A
+    // recall-only check would NOT catch the regression, because the first
+    // Search() lazily uploads and frees the copy — masking the load-time leak
+    // that OOMs before any search runs.
+    SECTION("DeserializeFromFile uploads to GPU and frees the host copy") {
+        const bool enable_mmap = GENERATE(false, true);
+        CAPTURE(enable_mmap);
+        auto json = sq_json(knowhere::metric::COSINE, "sq8", 10);
+
+        auto train_ds = GenDataSet(nb, dim, seed);
+        auto query_ds = GenDataSet(nq, dim, seed + 2);
+
+        auto cpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW_SQ, version)
+                           .value();
+        REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+        knowhere::BinarySet bs;
+        REQUIRE(cpu_idx.Serialize(bs) == knowhere::Status::success);
+        auto binary = bs.GetByName(cpu_idx.Type());
+        REQUIRE(binary != nullptr);
+
+        const auto path = std::filesystem::temp_directory_path() /
+                          ("knowhere_gpu_hnsw_deserialize_from_file_" + std::to_string(enable_mmap) + ".index");
+        std::filesystem::remove(path);
+        {
+            std::ofstream out(path, std::ios::binary);
+            REQUIRE(out.is_open());
+            out.write(reinterpret_cast<const char*>(binary->data.get()), binary->size);
+        }
+
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        auto load_json = json;
+        load_json["enable_mmap"] = enable_mmap;
+        REQUIRE(gpu_idx.DeserializeFromFile(path.string(), load_json) == knowhere::Status::success);
+
+        // Eager upload ran during load (no search yet): host copy released.
+        REQUIRE(gpu_idx.Size() == 0);
+        REQUIRE(gpu_idx.Count() == nb);
+        REQUIRE(gpu_idx.HasRawData(knowhere::metric::COSINE) == false);
+
+        // And the GPU index actually serves searches.
+        auto results = gpu_idx.Search(query_ds, json, nullptr);
+        REQUIRE(results.has_value());
+        auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, json, nullptr);
+        REQUIRE(gt.has_value());
+        float recall = GetKNNRecall(*gt.value(), *results.value());
+        REQUIRE(recall >= 0.65f);
+
+        std::filesystem::remove(path);
     }
 
     // #1b: quantized-cosine parity. The discriminating input is vectors that

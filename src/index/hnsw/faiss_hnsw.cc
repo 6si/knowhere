@@ -3433,12 +3433,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     Status
     Deserialize(const BinarySet& binset, std::shared_ptr<Config> cfg) override {
         std::unique_lock lock(gpu_mutex_);
-        // Unpublish before tearing down: on a reload a stale gpu_ready_==true
-        // combined with a reset (or failed re-upload of) gpu_index_ would let the
-        // lock-free reader in Search() dereference a null index. Clear it under
-        // the same lock so a failed re-upload leaves the node honestly "not ready".
-        gpu_ready_.store(false, std::memory_order_release);
-        gpu_index_ = nullptr;
+        UnpublishGpuIndexLocked();
 
         // Accept CPU-built HNSW (F32) or HNSW_SQ (quantized) binaries.
         Status status;
@@ -3458,47 +3453,26 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
             return status;
         }
 
-        // Eager GPU upload via faiss::gpu::GpuIndexHNSW.
-        const auto* faiss_idx = GetFaissHnswIndex();
-        if (faiss_idx) {
-            try {
-                // Detect metric from the FAISS index type rather than config,
-                // because Deserialize may be called without metric_type in the config
-                // (e.g. empty json defaults metric_type to L2).
-                bool is_cosine =
-                    dynamic_cast<const ::faiss::cppcontrib::knowhere::HasInverseL2Norms*>(faiss_idx) != nullptr;
-                bool use_ip = is_cosine || (faiss_idx->metric_type == ::faiss::METRIC_INNER_PRODUCT);
+        return UploadCpuIndexToGpuLocked();
+    }
 
-                std::shared_ptr<faiss::gpu::GpuIndexHNSW> local;
-                {
-                    std::lock_guard<std::mutex> gpu_ctor_lock(GetGpuConstructionMutex());
-                    gpu_resources_ = GetSharedGpuResources();
-                    local = std::make_shared<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
-                                                                       faiss_idx->metric_type);
-                }
-                local->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
-                // Capture count/dim before releasing the CPU copy so Count()/
-                // Dim() keep working once indexes[0] is freed.
-                gpu_ntotal_ = faiss_idx->ntotal;
-                gpu_dim_ = faiss_idx->d;
-                // Release CPU copy — vectors and graph are now on GPU.
-                indexes[0].reset();
-                // Publish the fully-built index under gpu_mutex_ (held for this
-                // whole method); Search() takes a locked snapshot. gpu_ready_ is
-                // published last for the lock-free Count()/Dim() readers.
-                gpu_index_ = local;
-                gpu_ready_.store(true, std::memory_order_release);
-            } catch (const std::exception& e) {
-                // Fail the load rather than reporting success with no GPU index:
-                // a silently "loaded" segment would only surface the error on the
-                // first search. Leave the member null so gpu_ready_ stays false
-                // and return an error so the caller treats the load as failed.
-                LOG_KNOWHERE_ERROR_ << "eager GPU upload failed: " << e.what();
-                gpu_index_ = nullptr;
-                return Status::cuda_runtime_error;
-            }
+    // Milvus loads sealed segments through the mmap/file path
+    // (VectorMemIndex::LoadFromFile -> DeserializeFromFile), NOT Deserialize().
+    // The base only materializes the CPU index, so without this override the
+    // eager GPU upload would never run on that path: the CPU-built HNSW would
+    // stay resident in host RAM (fp32-expanded for quantized inputs) and the GPU
+    // would sit unused. Load the CPU index via the base, then upload + free it.
+    Status
+    DeserializeFromFile(const std::string& filename, std::shared_ptr<Config> config) override {
+        std::unique_lock lock(gpu_mutex_);
+        UnpublishGpuIndexLocked();
+
+        auto status = BaseFaissRegularIndexHNSWNode::DeserializeFromFile(filename, config);
+        if (status != Status::success) {
+            return status;
         }
-        return Status::success;
+
+        return UploadCpuIndexToGpuLocked();
     }
 
     expected<DataSetPtr>
@@ -3607,6 +3581,67 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     ~GpuHnswIndexNode() override = default;
 
  private:
+    // Requires gpu_mutex_ held. Unpublish before tearing down: on a reload a
+    // stale gpu_ready_==true combined with a reset (or failed re-upload of)
+    // gpu_index_ would let the lock-free reader in Search() dereference a null
+    // index. Clearing it here leaves the node honestly "not ready" if the
+    // subsequent (re-)upload fails.
+    void
+    UnpublishGpuIndexLocked() {
+        gpu_ready_.store(false, std::memory_order_release);
+        gpu_index_ = nullptr;
+    }
+
+    // Requires gpu_mutex_ held. Uploads the just-deserialized CPU HNSW to the GPU
+    // via faiss::gpu::GpuIndexHNSW, releases the host copy, and publishes the
+    // device index. Shared by Deserialize() (BinarySet) and DeserializeFromFile()
+    // (Milvus mmap/file load path) so both entrypoints upload identically. A
+    // no-op success when there is no CPU index to upload (empty segment).
+    Status
+    UploadCpuIndexToGpuLocked() {
+        const auto* faiss_idx = GetFaissHnswIndex();
+        if (faiss_idx == nullptr) {
+            return Status::success;
+        }
+        try {
+            // Detect metric from the FAISS index type rather than config, because
+            // deserialize may be called without metric_type in the config (e.g.
+            // an empty json defaults metric_type to L2).
+            bool is_cosine =
+                dynamic_cast<const ::faiss::cppcontrib::knowhere::HasInverseL2Norms*>(faiss_idx) != nullptr;
+            bool use_ip = is_cosine || (faiss_idx->metric_type == ::faiss::METRIC_INNER_PRODUCT);
+
+            std::shared_ptr<faiss::gpu::GpuIndexHNSW> local;
+            {
+                std::lock_guard<std::mutex> gpu_ctor_lock(GetGpuConstructionMutex());
+                gpu_resources_ = GetSharedGpuResources();
+                local = std::make_shared<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
+                                                                   faiss_idx->metric_type);
+            }
+            local->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
+            // Capture count/dim before releasing the CPU copy so Count()/Dim()
+            // keep working once indexes[0] is freed.
+            gpu_ntotal_ = faiss_idx->ntotal;
+            gpu_dim_ = faiss_idx->d;
+            // Release CPU copy — vectors and graph are now on GPU. This is what
+            // drops the transient host-RAM peak back to ~0.
+            indexes[0].reset();
+            // Publish last: Search() takes a locked snapshot of gpu_index_, and
+            // gpu_ready_ is released for the lock-free Count()/Dim() readers.
+            gpu_index_ = local;
+            gpu_ready_.store(true, std::memory_order_release);
+        } catch (const std::exception& e) {
+            // Fail the load rather than reporting success with no GPU index: a
+            // silently "loaded" segment would only surface the error on the first
+            // search. Leave the member null so gpu_ready_ stays false and return
+            // an error so the caller treats the load as failed.
+            LOG_KNOWHERE_ERROR_ << "eager GPU upload failed: " << e.what();
+            gpu_index_ = nullptr;
+            return Status::cuda_runtime_error;
+        }
+        return Status::success;
+    }
+
     const ::faiss::cppcontrib::knowhere::IndexHNSW*
     GetFaissHnswIndex() const {
         if (indexes.empty() || !indexes[0])
