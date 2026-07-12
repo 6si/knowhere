@@ -3357,10 +3357,21 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     static expected<Resource>
     StaticEstimateLoadResource(const uint64_t file_size_in_bytes, const int64_t num_rows, const int64_t dim,
                                const knowhere::BaseConfig& config, const IndexVersion& version) {
-        // GPU HNSW stores vectors and graph in VRAM; the CPU copy is freed
-        // after upload in Deserialize(). Report zero CPU memory cost so the
-        // Milvus segment loader does not over-commit host RAM reservations.
-        return Resource{.memoryCost = 0, .diskCost = 0};
+        // GPU HNSW stores vectors and graph in VRAM; the CPU copy is freed after
+        // upload in Deserialize(). Phase-separated accounting:
+        //   memoryCost (retained after load): ~0 — the CPU index is released
+        //     once the graph/vectors are on the GPU.
+        //   maxMemoryCost (transient peak during load): the loader must reserve
+        //     enough host RAM to cover the simultaneously-live buffers before the
+        //     GPU upload frees the CPU copy:
+        //       - the serialized download buffer (~file_size),
+        //       - the deserialized CPU HNSW index: vectors + graph (~file_size),
+        //       - fp32 decode/graph staging for the upload (num_rows*dim*4).
+        const uint64_t rows = num_rows > 0 ? static_cast<uint64_t>(num_rows) : 0;
+        const uint64_t d = dim > 0 ? static_cast<uint64_t>(dim) : 0;
+        const uint64_t decode_staging = rows * d * sizeof(float);
+        const uint64_t peak = file_size_in_bytes + file_size_in_bytes + decode_staging;
+        return Resource{.memoryCost = 0, .diskCost = 0, .maxMemoryCost = peak};
     }
 
     std::unique_ptr<BaseConfig>
@@ -3427,7 +3438,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         // lock-free reader in Search() dereference a null index. Clear it under
         // the same lock so a failed re-upload leaves the node honestly "not ready".
         gpu_ready_.store(false, std::memory_order_release);
-        gpu_index_.reset();
+        gpu_index_.store(nullptr, std::memory_order_release);
 
         // Accept CPU-built HNSW (F32) or HNSW_SQ (quantized) binaries.
         Status status;
@@ -3458,29 +3469,31 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                     dynamic_cast<const ::faiss::cppcontrib::knowhere::HasInverseL2Norms*>(faiss_idx) != nullptr;
                 bool use_ip = is_cosine || (faiss_idx->metric_type == ::faiss::METRIC_INNER_PRODUCT);
 
+                std::shared_ptr<faiss::gpu::GpuIndexHNSW> local;
                 {
                     std::lock_guard<std::mutex> gpu_ctor_lock(GetGpuConstructionMutex());
                     gpu_resources_ = GetSharedGpuResources();
-                    gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
-                                                                            faiss_idx->metric_type);
+                    local = std::make_shared<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
+                                                                       faiss_idx->metric_type);
                 }
-                gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
+                local->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
                 // Capture count/dim before releasing the CPU copy so Count()/
                 // Dim() keep working once indexes[0] is freed.
                 gpu_ntotal_ = faiss_idx->ntotal;
                 gpu_dim_ = faiss_idx->d;
                 // Release CPU copy — vectors and graph are now on GPU.
                 indexes[0].reset();
-                // Publish gpu_index_ with release semantics; the lock-free
-                // reader in Search() pairs this with an acquire load.
+                // Publish the fully-built index (release); Search() takes an
+                // acquire snapshot. gpu_ready_ is published last for Count()/Dim().
+                gpu_index_.store(local, std::memory_order_release);
                 gpu_ready_.store(true, std::memory_order_release);
             } catch (const std::exception& e) {
                 // Fail the load rather than reporting success with no GPU index:
                 // a silently "loaded" segment would only surface the error on the
-                // first search. Reset so gpu_ready_ stays false and return an error
-                // status so the caller treats the segment as failed to load.
+                // first search. Leave the member null so gpu_ready_ stays false
+                // and return an error so the caller treats the load as failed.
                 LOG_KNOWHERE_ERROR_ << "eager GPU upload failed: " << e.what();
-                gpu_index_.reset();
+                gpu_index_.store(nullptr, std::memory_order_release);
                 return Status::cuda_runtime_error;
             }
         }
@@ -3498,11 +3511,15 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
             return expected<DataSetPtr>::Err(Status::invalid_args, "GPU_HNSW does not support filtered search");
         }
 
-        // Fast path: gpu_ready_ is published (release) once gpu_index_ is fully
-        // constructed; the acquire load here avoids a data race on the pointer.
-        if (!gpu_ready_.load(std::memory_order_acquire)) {
+        // Take a shared-ownership snapshot of the GPU index up front. It keeps
+        // the index alive for the whole search even if a concurrent
+        // Deserialize() reload resets/rebuilds gpu_index_; a bare atomic
+        // readiness flag would guarantee visibility but not lifetime.
+        std::shared_ptr<faiss::gpu::GpuIndexHNSW> gpu_snapshot = gpu_index_.load(std::memory_order_acquire);
+        if (!gpu_snapshot) {
             std::unique_lock lock(gpu_mutex_);
-            if (!gpu_ready_.load(std::memory_order_relaxed)) {
+            gpu_snapshot = gpu_index_.load(std::memory_order_relaxed);
+            if (!gpu_snapshot) {
                 const auto* faiss_idx = GetFaissHnswIndex();
                 if (!faiss_idx) {
                     return expected<DataSetPtr>::Err(Status::empty_index, "index not loaded");
@@ -3512,17 +3529,20 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                     bool is_cosine = IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE);
                     bool use_ip = IsMetricType(hnsw_cfg.metric_type.value(), metric::IP) || is_cosine;
 
+                    std::shared_ptr<faiss::gpu::GpuIndexHNSW> local;
                     {
                         std::lock_guard<std::mutex> gpu_ctor_lock(GetGpuConstructionMutex());
                         gpu_resources_ = GetSharedGpuResources();
-                        gpu_index_ = std::make_unique<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
-                                                                                faiss_idx->metric_type);
+                        local = std::make_shared<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
+                                                                           faiss_idx->metric_type);
                     }
-                    gpu_index_->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
+                    local->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
                     gpu_ntotal_ = faiss_idx->ntotal;
                     gpu_dim_ = faiss_idx->d;
                     const_cast<std::shared_ptr<faiss::Index>&>(indexes[0]).reset();
+                    gpu_index_.store(local, std::memory_order_release);
                     gpu_ready_.store(true, std::memory_order_release);
+                    gpu_snapshot = local;
                 } catch (const std::exception& e) {
                     return expected<DataSetPtr>::Err(Status::cuvs_inner_error,
                                                      std::string("failed to build GPU HNSW index: ") + e.what());
@@ -3559,7 +3579,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         try {
             faiss::gpu::GpuHnswSearchParams gsp;
             gsp.ef = ef;
-            gpu_index_->searchHost(nq, h_queries, k, h_dist.get(), h_ids.get(), gsp);
+            gpu_snapshot->searchHost(nq, h_queries, k, h_dist.get(), h_ids.get(), gsp);
         } catch (const std::exception& e) {
             LOG_KNOWHERE_ERROR_ << "GPU_HNSW search failed: " << e.what();
             return expected<DataSetPtr>::Err(Status::cuvs_inner_error,
@@ -3589,9 +3609,14 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
 
     mutable std::mutex gpu_mutex_;
     mutable std::shared_ptr<faiss::gpu::StandardGpuResources> gpu_resources_;
-    mutable std::unique_ptr<faiss::gpu::GpuIndexHNSW> gpu_index_;
+    // Held as an atomic shared_ptr so Search() can take a shared-ownership
+    // snapshot that keeps the GPU index alive for the entire search even if a
+    // concurrent Deserialize() reload resets/rebuilds the member. Atomic
+    // readiness (gpu_ready_) only guarantees visibility, not lifetime, so a
+    // bare pointer read on the search fast path would be a use-after-free.
+    mutable std::atomic<std::shared_ptr<faiss::gpu::GpuIndexHNSW>> gpu_index_;
     // Published (release) after gpu_index_ is fully built; read lock-free
-    // (acquire) on the search fast path and by Count()/Dim()/HasRawData().
+    // (acquire) by Count()/Dim()/HasRawData()/GetVectorByIds().
     mutable std::atomic<bool> gpu_ready_{false};
     // Vector count/dim captured before the CPU copy is freed (written from the
     // const lazy-upload path in Search(), hence mutable).

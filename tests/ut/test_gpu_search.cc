@@ -9,7 +9,11 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
+#include <atomic>
+#include <cmath>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "catch2/catch_approx.hpp"
 #include "catch2/catch_test_macros.hpp"
@@ -952,6 +956,299 @@ TEST_CASE("Test CPU vs GPU HNSW Comparison", "[gpu_hnsw_compare]") {
             REQUIRE(gpu_recall >= 0.5f);
         }
         fprintf(stderr, "===\n\n");
+    }
+}
+
+// Regression tests for the three Codex P1 findings on the gpu-hnsw-faiss branch:
+//   #1 quantized-cosine inverse-norm semantics (native low-precision kernels +
+//      SQ8/FP16/BF16 cosine parity),
+//   #2 search-vs-reload lifetime safety,
+//   #3 phase-separated load-resource accounting.
+TEST_CASE("Test GPU HNSW Codex P1 Regressions", "[gpu_hnsw_p1]") {
+    using Catch::Approx;
+
+    const int64_t nb = 4000, nq = 200;
+    const int64_t dim = 64;
+    const int64_t seed = 42;
+    const auto version = GenTestVersionList();
+
+    auto sq_json = [&](const std::string& metric, const std::string& sq_type, int64_t topk) {
+        knowhere::Json json;
+        json[knowhere::meta::DIM] = dim;
+        json[knowhere::meta::METRIC_TYPE] = metric;
+        json[knowhere::meta::TOPK] = topk;
+        json[knowhere::indexparam::HNSW_M] = 16;
+        json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+        json[knowhere::indexparam::EF] = 200;
+        json[knowhere::indexparam::SQ_TYPE] = sq_type;
+        return json;
+    };
+
+    // Build an HNSW_SQ index on the fp32 (real, non-mock) node so the serialized
+    // storage carries the requested SQ qtype. Deserializing that as GPU_HNSW on
+    // the fp32 node selects the native device representation from the storage
+    // qtype (FP16 -> half kernel, BF16 -> __nv_bfloat16 kernel, SQ8 -> fp32
+    // decode). This bypasses the int8/fp16/bf16 IndexNodeDataMockWrapper, which
+    // otherwise converts data to fp32 and routes the fp32 kernel.
+
+    // #1a: native low-precision (FP16/BF16) and SQ8 device paths — L2.
+    SECTION("Native low-precision device path (L2): FP16 / BF16 / SQ8") {
+        const auto sq_type = GENERATE(std::string("fp16"), std::string("bf16"), std::string("sq8"));
+        CAPTURE(sq_type);
+        auto json = sq_json(knowhere::metric::L2, sq_type, 10);
+
+        auto train_ds = GenDataSet(nb, dim, seed);
+        auto query_ds = GenDataSet(nq, dim, seed + 2);
+
+        auto cpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW_SQ, version)
+                           .value();
+        REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+        auto results = gpu_idx.Search(query_ds, json, nullptr);
+        REQUIRE(results.has_value());
+        auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, json, nullptr);
+        REQUIRE(gt.has_value());
+        float recall = GetKNNRecall(*gt.value(), *results.value());
+        // Lossy SQ paths; a conservative floor. fp16/bf16 are near-lossless, sq8
+        // coarser.
+        REQUIRE(recall >= (sq_type == "sq8" ? 0.65f : 0.85f));
+    }
+
+    // #1b: quantized-cosine parity. The discriminating input is vectors that
+    // share directions but have widely different magnitudes: cosine must ignore
+    // magnitude. The CPU cosine index records inverse norms from the ORIGINAL
+    // input vectors; the GPU path must upload those same norms rather than
+    // recomputing them from lossily-decoded codes. With the pre-fix behavior
+    // (recompute-from-decoded / normalize-decoded) the SQ8 scores and top-1 IDs
+    // diverge from the CPU index. Assert per-query top-1 ID and per-result score,
+    // not just aggregate recall.
+    SECTION("Quantized cosine parity (CPU vs GPU): SQ8 / FP16 / BF16") {
+        const auto sq_type = GENERATE(std::string("sq8"), std::string("fp16"), std::string("bf16"));
+        CAPTURE(sq_type);
+        const int64_t topk = 10;
+        auto json = sq_json(knowhere::metric::COSINE, sq_type, topk);
+
+        // Directions from a fixed RNG, then scale each row by a magnitude that
+        // spans three orders of magnitude so magnitude cannot be ignored by luck.
+        auto make_scaled = [&](int64_t rows, int64_t s) {
+            auto ds = GenDataSet(rows, dim, s);
+            auto* data = const_cast<float*>(static_cast<const float*>(ds->GetTensor()));
+            std::mt19937 rng(static_cast<uint32_t>(s + 7));
+            std::uniform_real_distribution<float> mag(0.5f, 500.0f);
+            for (int64_t r = 0; r < rows; ++r) {
+                float scale = mag(rng);
+                for (int64_t d = 0; d < dim; ++d) {
+                    data[r * dim + d] *= scale;
+                }
+            }
+            return ds;
+        };
+        auto train_ds = make_scaled(nb, seed);
+        auto query_ds = make_scaled(nq, seed + 2);
+
+        auto cpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW_SQ, version)
+                           .value();
+        REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+        auto cpu_results = cpu_idx.Search(query_ds, json, nullptr);
+        REQUIRE(cpu_results.has_value());
+
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+        auto gpu_results = gpu_idx.Search(query_ds, json, nullptr);
+        REQUIRE(gpu_results.has_value());
+
+        const auto* cpu_ids = cpu_results.value()->GetIds();
+        const auto* gpu_ids = gpu_results.value()->GetIds();
+        const auto* cpu_dist = cpu_results.value()->GetDistance();
+        const auto* gpu_dist = gpu_results.value()->GetDistance();
+
+        // Top-1 must match the CPU index for the overwhelming majority of
+        // queries: identical cosine semantics (same norms) means identical
+        // nearest neighbor modulo rare quantization ties.
+        int top1_match = 0;
+        for (int64_t q = 0; q < nq; ++q) {
+            if (cpu_ids[q * topk] == gpu_ids[q * topk]) {
+                top1_match++;
+            }
+        }
+        float top1_ratio = static_cast<float>(top1_match) / nq;
+        CAPTURE(top1_ratio);
+        REQUIRE(top1_ratio >= 0.95f);
+
+        // Per-result cosine scores must agree closely (both decode identical SQ
+        // codes and apply the SAME original inverse norms). A loose floor would
+        // hide the pre-fix norm mismatch, so keep the tolerance tight.
+        int compared = 0, close = 0;
+        for (int64_t q = 0; q < nq; ++q) {
+            // Only compare positions where CPU and GPU agree on the id, so score
+            // comparison is like-for-like.
+            for (int64_t j = 0; j < topk; ++j) {
+                if (cpu_ids[q * topk + j] == gpu_ids[q * topk + j]) {
+                    compared++;
+                    if (GetRelativeLoss(cpu_dist[q * topk + j], gpu_dist[q * topk + j]) < 0.02f) {
+                        close++;
+                    }
+                }
+            }
+        }
+        REQUIRE(compared > 0);
+        float close_ratio = static_cast<float>(close) / compared;
+        CAPTURE(close_ratio);
+        REQUIRE(close_ratio >= 0.98f);
+    }
+
+    // #2: search must not use-after-free a GPU index that a concurrent reload
+    // resets/rebuilds. Search continuously from several threads while another
+    // thread repeatedly Deserialize()s (reloads) the same index. Run under
+    // TSAN/ASAN to catch the lifetime race the atomic<shared_ptr> snapshot fixes.
+    SECTION("Search vs concurrent reload (lifetime safety)") {
+        auto json = sq_json(knowhere::metric::L2, "fp16", 10);
+        json.erase(knowhere::indexparam::SQ_TYPE);  // plain fp32 HNSW for the reload driver
+        auto train_ds = GenDataSet(nb, dim, seed);
+        auto query_ds = GenDataSet(nq, dim, seed + 2);
+
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+        std::atomic<bool> stop{false};
+        std::atomic<bool> failed{false};
+        std::vector<std::thread> searchers;
+        for (int t = 0; t < 6; ++t) {
+            searchers.emplace_back([&]() {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    auto r = gpu_idx.Search(query_ds, json, nullptr);
+                    // A search may race a reload window; success or a benign
+                    // "not ready" error are both acceptable, a crash is not.
+                    if (!r.has_value() && r.error() != knowhere::Status::empty_index &&
+                        r.error() != knowhere::Status::cuda_runtime_error) {
+                        failed.store(true, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+        std::thread reloader([&]() {
+            for (int i = 0; i < 30 && !stop.load(std::memory_order_relaxed); ++i) {
+                if (gpu_idx.Deserialize(bs) != knowhere::Status::success) {
+                    failed.store(true, std::memory_order_relaxed);
+                }
+            }
+            stop.store(true, std::memory_order_relaxed);
+        });
+        reloader.join();
+        stop.store(true, std::memory_order_relaxed);
+        for (auto& th : searchers) {
+            th.join();
+        }
+        REQUIRE(!failed.load());
+        // Index is still usable after the reload storm.
+        auto after = gpu_idx.Search(query_ds, json, nullptr);
+        REQUIRE(after.has_value());
+    }
+
+    // Codex coverage #3: more than four simultaneous searches (the device scratch
+    // pool has four slots), with varying nq/k/ef, each validated against its own
+    // brute-force ground truth. Exercises scratch-pool contention/serialization.
+    SECTION("More than four concurrent searches with varying nq/k/ef") {
+        auto build_json = sq_json(knowhere::metric::L2, "fp16", 10);
+        build_json.erase(knowhere::indexparam::SQ_TYPE);
+        auto train_ds = GenDataSet(nb, dim, seed);
+
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        REQUIRE(cpu_idx.Build(train_ds, build_json) == knowhere::Status::success);
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+        struct Case {
+            int64_t nq;
+            int64_t k;
+            int ef;
+        };
+        const std::vector<Case> cases = {{50, 5, 32},   {120, 10, 64}, {200, 20, 128}, {80, 50, 256},
+                                         {30, 10, 512}, {150, 1, 48},  {64, 100, 300}, {90, 25, 96}};
+        std::atomic<bool> ok{true};
+        std::vector<std::thread> threads;
+        for (const auto& c : cases) {
+            threads.emplace_back([&, c]() {
+                knowhere::Json j;
+                j[knowhere::meta::DIM] = dim;
+                j[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+                j[knowhere::meta::TOPK] = c.k;
+                j[knowhere::indexparam::EF] = c.ef;
+                auto q = GenDataSet(c.nq, dim, seed + 100 + c.ef);
+                auto r = gpu_idx.Search(q, j, nullptr);
+                if (!r.has_value()) {
+                    ok.store(false, std::memory_order_relaxed);
+                    return;
+                }
+                auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, q, j, nullptr);
+                if (!gt.has_value() || GetKNNRecall(*gt.value(), *r.value()) < 0.7f) {
+                    ok.store(false, std::memory_order_relaxed);
+                }
+            });
+        }
+        for (auto& th : threads) {
+            th.join();
+        }
+        REQUIRE(ok.load());
+    }
+
+    // #3: phase-separated load-resource accounting. GPU_HNSW frees its CPU copy
+    // after uploading to VRAM, so retained memoryCost is 0 while the transient
+    // peak (maxMemoryCost) must be non-zero and cover the download buffer +
+    // deserialized CPU index + decode/graph staging. This estimate is a static
+    // computation and needs no live GPU.
+    SECTION("Load-resource estimate: memoryCost=0, maxMemoryCost covers peak") {
+        knowhere::Json params;
+        params[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+        params[knowhere::meta::DIM] = dim;
+
+        const uint64_t file_size = static_cast<uint64_t>(nb) * dim * sizeof(float);
+        auto gpu_res = knowhere::IndexStaticFaced<knowhere::fp32>::EstimateLoadResource(
+            knowhere::IndexEnum::INDEX_GPU_HNSW, version, file_size, nb, dim, params);
+        REQUIRE(gpu_res.has_value());
+        // Retained host memory is ~0 after the CPU copy is freed.
+        REQUIRE(gpu_res.value().memoryCost == 0);
+        REQUIRE(gpu_res.value().diskCost == 0);
+        // Transient peak is non-zero and at least covers the fp32 decode staging
+        // plus the download buffer (2*file_size + rows*dim*4 in the estimator).
+        REQUIRE(gpu_res.value().maxMemoryCost > 0);
+        const uint64_t decode_staging = static_cast<uint64_t>(nb) * dim * sizeof(float);
+        REQUIRE(gpu_res.value().maxMemoryCost >= file_size + decode_staging);
+
+        // A plain CPU HNSW keeps its data resident: memoryCost is non-zero and it
+        // does not opt into the peak field (maxMemoryCost stays 0 -> Milvus falls
+        // back to its 2*memoryCost heuristic).
+        auto cpu_res = knowhere::IndexStaticFaced<knowhere::fp32>::EstimateLoadResource(
+            knowhere::IndexEnum::INDEX_HNSW, version, file_size, nb, dim, params);
+        REQUIRE(cpu_res.has_value());
+        REQUIRE(cpu_res.value().memoryCost > 0);
+        REQUIRE(cpu_res.value().maxMemoryCost == 0);
     }
 }
 #endif
