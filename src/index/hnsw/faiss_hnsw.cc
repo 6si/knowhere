@@ -3731,64 +3731,61 @@ register_gpu_hnsw_static_config() {
     IndexStaticFaced<int8>::Instance().RegisterStaticFunc<GpuHnswSQIndexNode>(IndexEnum::INDEX_GPU_HNSW_SQ);
 }
 
-// NOTE: feature::MMAP is intentionally set. Although GPU_HNSW ultimately holds
-// its vectors/graph in VRAM (the CPU copy is freed after upload), the CPU index
-// is deserialized via the mmap-capable file path during load. Advertising MMAP
-// lets Milvus keep enableMmap=true so the transient CPU HNSW is file-backed
-// rather than anonymous host RAM before the GPU upload frees it -- without this,
-// the override HNSW->GPU_HNSW silently disables mmap and the full fp32-expanded
-// index lands in anon RAM (the post-override host OOM regression).
+// GPU_HNSW is not registered as MMAP-capable: the CPU index is deserialized
+// into host RAM, uploaded to VRAM, then the CPU copy is freed. For a native
+// int8 index the transient CPU copy is compact (~1 byte/dim), matching how the
+// CPU HNSW int8 node loads, so no memory-mapped-file path is required.
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) { return Index<GpuHnswIndexNode>::Create(version, object); }, fp32,
-    true, (feature::GPU_ANN_FLOAT_INDEX | feature::MMAP));
+    true, (feature::GPU_ANN_FLOAT_INDEX));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<fp16>>::Create(std::make_unique<GpuHnswIndexNode>(version, object));
     },
-    fp16, true, (feature::FP16 | feature::GPU | feature::MMAP));
+    fp16, true, (feature::FP16 | feature::GPU));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<bf16>>::Create(std::make_unique<GpuHnswIndexNode>(version, object));
     },
-    bf16, true, (feature::BF16 | feature::GPU | feature::MMAP));
+    bf16, true, (feature::BF16 | feature::GPU));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<int8>>::Create(std::make_unique<GpuHnswIndexNode>(version, object));
     },
-    int8, true, (feature::INT8 | feature::GPU | feature::MMAP));
+    int8, true, (feature::INT8 | feature::GPU));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
     [](const int32_t& version, const Object& object) { return Index<GpuHnswSQIndexNode>::Create(version, object); },
-    fp32, true, (feature::GPU_ANN_FLOAT_INDEX | feature::MMAP));
+    fp32, true, (feature::GPU_ANN_FLOAT_INDEX));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<fp16>>::Create(std::make_unique<GpuHnswSQIndexNode>(version, object));
     },
-    fp16, true, (feature::FP16 | feature::GPU | feature::MMAP));
+    fp16, true, (feature::FP16 | feature::GPU));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<bf16>>::Create(std::make_unique<GpuHnswSQIndexNode>(version, object));
     },
-    bf16, true, (feature::BF16 | feature::GPU | feature::MMAP));
+    bf16, true, (feature::BF16 | feature::GPU));
 
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
     [](const int32_t& version, const Object& object) {
         return Index<IndexNodeDataMockWrapper<int8>>::Create(std::make_unique<GpuHnswSQIndexNode>(version, object));
     },
-    int8, true, (feature::INT8 | feature::GPU | feature::MMAP));
+    int8, true, (feature::INT8 | feature::GPU));
 #endif  // KNOWHERE_WITH_CUVS
 
 }  // namespace knowhere
