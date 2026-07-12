@@ -27,6 +27,10 @@
 
 #ifdef KNOWHERE_WITH_CUVS
 
+// Host-safe header (no device kernels) exposing GpuHnswUploadFaultInjection, the
+// test-only hook used by the CUDA-upload fault-injection section below.
+#include <faiss/gpu/impl/GpuHnswTypes.h>
+
 template <typename T>
 void
 check_search(const int64_t nb, const int64_t nq, const int64_t dim, const int64_t seed, std::string name, int version,
@@ -1251,6 +1255,74 @@ TEST_CASE("Test GPU HNSW Codex P1 Regressions", "[gpu_hnsw_p1]") {
         REQUIRE(cpu_res.has_value());
         REQUIRE(cpu_res.value().memoryCost > 0);
         REQUIRE(cpu_res.value().maxMemoryCost == 0);
+    }
+
+    // Codex coverage #5: CUDA-upload fault injection during Deserialize(). Using
+    // the test-only GpuHnswUploadFaultInjection hook, force the eager GPU upload
+    // to fail both at the very first wrapped CUDA call (immediate) and mid-upload
+    // (after several allocations have already succeeded, exercising the device
+    // index destructor's partial-allocation cleanup). Assert: (1) the load
+    // reports failure, (2) nothing is half-published (a search while re-armed
+    // errors cleanly rather than using a partial index or crashing), (3) VRAM
+    // returns to baseline after the failed loads + node teardown (no leak), and
+    // (4) a subsequent fault-free load succeeds and searches correctly.
+    SECTION("CUDA upload fault injection: load fails, nothing half-published, retry succeeds") {
+        auto json = sq_json(knowhere::metric::L2, "fp16", 10);
+        json.erase(knowhere::indexparam::SQ_TYPE);  // plain fp32 HNSW
+        auto train_ds = GenDataSet(nb, dim, seed);
+        auto query_ds = GenDataSet(nq, dim, seed + 3);
+
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        size_t free_before = 0, total = 0;
+        REQUIRE(cudaMemGetInfo(&free_before, &total) == cudaSuccess);
+
+        // fail_at = 1 fails the first cudaMalloc (immediate); fail_at = 4 fails
+        // after several buffers are already on the device (mid-upload cleanup).
+        for (int fail_at : {1, 4}) {
+            CAPTURE(fail_at);
+            auto gpu_idx = knowhere::IndexFactory::Instance()
+                               .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                               .value();
+
+            faiss::gpu::GpuHnswUploadFaultInjection::arm(fail_at);
+            auto st = gpu_idx.Deserialize(bs);
+            faiss::gpu::GpuHnswUploadFaultInjection::disarm();
+            // (1) load fails rather than reporting a silently-broken segment.
+            REQUIRE(st != knowhere::Status::success);
+
+            // (2) no half-published index: re-arm so the lazy-upload retry inside
+            // Search() also faults, proving the failed load left no usable index
+            // behind and the search path errors cleanly (no crash / no results).
+            faiss::gpu::GpuHnswUploadFaultInjection::arm(fail_at);
+            auto r = gpu_idx.Search(query_ds, json, nullptr);
+            faiss::gpu::GpuHnswUploadFaultInjection::disarm();
+            REQUIRE(!r.has_value());
+        }
+
+        // (3) no leak: after the failed loads and node teardown, free VRAM must
+        // return to ~baseline (allow slack for allocator/context fragmentation).
+        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+        size_t free_after = 0;
+        REQUIRE(cudaMemGetInfo(&free_after, &total) == cudaSuccess);
+        const size_t slack = static_cast<size_t>(64) * 1024 * 1024;  // 64 MiB
+        REQUIRE(free_after + slack >= free_before);
+
+        // (4) retry with the fault disarmed succeeds and returns valid results.
+        faiss::gpu::GpuHnswUploadFaultInjection::disarm();
+        auto gpu_ok = knowhere::IndexFactory::Instance()
+                          .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                          .value();
+        REQUIRE(gpu_ok.Deserialize(bs) == knowhere::Status::success);
+        auto r_ok = gpu_ok.Search(query_ds, json, nullptr);
+        REQUIRE(r_ok.has_value());
+        auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, json, nullptr);
+        REQUIRE(gt.has_value());
+        REQUIRE(GetKNNRecall(*gt.value(), *r_ok.value()) >= 0.8f);
     }
 }
 #endif
