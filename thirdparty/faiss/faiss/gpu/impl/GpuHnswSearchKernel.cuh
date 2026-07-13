@@ -78,6 +78,23 @@ __device__ __forceinline__ float thread_ip_distance(
     return -sum;
 }
 
+// DP4A inner-product distance for int8 queries vs int8 dataset.
+// Both query and vec must already be in the same encoding (both shifted +128
+// relative to the user's signed int8 values, matching upload_int8_dataset).
+// Computes -dot(query, vec) as a float (max-IP / negative dot convention).
+// dim4 = dim / 4 (caller must ensure dim % 4 == 0).
+__device__ __forceinline__ float thread_ip_distance_dp4a(
+        const int32_t* __restrict__ query_packed,
+        const int32_t* __restrict__ vec_packed,
+        int dim4) {
+    int sum = 0;
+#pragma unroll 8
+    for (int d = 0; d < dim4; d++) {
+        sum = __dp4a(query_packed[d], vec_packed[d], sum);
+    }
+    return static_cast<float>(-sum);  // negate: max-IP convention
+}
+
 // ============================================================================
 // Phase 1: Upper-layer greedy search
 // ============================================================================
@@ -459,6 +476,261 @@ __global__ void layer0_beam_search_kernel(
         __syncthreads();
 
         // Stagnation detected when num_parents==0 (all expanded) → break above
+    }
+
+    // --- Copy top-k results to global memory ---
+    int rc = meta[0];
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        if (i < rc) {
+            d_neighbors[static_cast<int64_t>(query_idx) * k + i] =
+                    static_cast<uint64_t>(result_ids[i]);
+            d_distances[static_cast<int64_t>(query_idx) * k + i] =
+                    result_dists[i];
+        } else {
+            d_neighbors[static_cast<int64_t>(query_idx) * k + i] = UINT64_MAX;
+            d_distances[static_cast<int64_t>(query_idx) * k + i] = FLT_MAX;
+        }
+    }
+}
+
+// ============================================================================
+// Phase 2 (int8/DP4A variant): Layer-0 parallel beam search kernel
+// Uses __dp4a for 4x int8 MADs per cycle instead of fp32 FMA.
+// d_queries_packed: int8 queries reinterpreted as int32 (shifted +128 to
+//   match upload_int8_dataset encoding); dim must be divisible by 4.
+// d_dataset: raw int8 dataset on device (already shifted -128 at upload time,
+//   now consistent with query shift so DP4A computes the correct dot product).
+// ============================================================================
+__global__ void layer0_beam_search_kernel_int8(
+        const int32_t* __restrict__ d_queries_packed,
+        const int8_t* __restrict__ d_dataset,
+        const float* __restrict__ d_inv_norms,
+        const uint32_t* __restrict__ d_layer0_graph,
+        const uint32_t* __restrict__ d_entry_points,
+        uint32_t* __restrict__ d_visited_bitmaps,
+        uint64_t* __restrict__ d_neighbors,
+        float* __restrict__ d_distances,
+        int num_queries,
+        int N,
+        int dim,
+        int max_degree0,
+        int k,
+        int ef,
+        int search_width,
+        int max_iterations,
+        bool use_inner_product) {
+    int query_idx = blockIdx.x;
+    if (query_idx >= num_queries)
+        return;
+
+    int dim4 = dim / 4;
+    const int32_t* query = d_queries_packed + static_cast<int64_t>(query_idx) * dim4;
+
+    extern __shared__ char smem[];
+
+    int max_staging = search_width * max_degree0;
+
+    uint32_t* result_ids = reinterpret_cast<uint32_t*>(smem);
+    float* result_dists = reinterpret_cast<float*>(result_ids + ef);
+    uint32_t* is_expanded = reinterpret_cast<uint32_t*>(result_dists + ef);
+    uint32_t* staging_ids = is_expanded + ef;
+    float* staging_dists = reinterpret_cast<float*>(staging_ids + max_staging);
+    uint32_t* parent_ids =
+            reinterpret_cast<uint32_t*>(staging_dists + max_staging);
+    int* meta = reinterpret_cast<int*>(parent_ids + search_width);
+
+    int bitmap_words = (N + 31) / 32;
+    uint32_t* visited_bmap =
+            d_visited_bitmaps + static_cast<int64_t>(query_idx) * bitmap_words;
+
+    for (int i = threadIdx.x; i < ef; i += blockDim.x) {
+        result_ids[i] = UINT32_MAX;
+        result_dists[i] = FLT_MAX;
+        is_expanded[i] = 0;
+    }
+    if (threadIdx.x == 0) {
+        meta[0] = 0;
+        meta[1] = 0;
+        meta[2] = 0;
+    }
+    __syncthreads();
+
+    // --- Seed with entry point ---
+    uint32_t ep = d_entry_points[query_idx];
+    if (threadIdx.x == 0) {
+        const int32_t* ep_packed =
+                reinterpret_cast<const int32_t*>(d_dataset + static_cast<int64_t>(ep) * dim);
+        float ep_dist = thread_ip_distance_dp4a(query, ep_packed, dim4);
+        if (!use_inner_product) {
+            // L2 fallback: should not happen for int8 DP4A path, but guard
+            ep_dist = ep_dist;  // keep as-is (ip convention, distance is valid)
+        }
+        if (d_inv_norms)
+            ep_dist *= __ldg(&d_inv_norms[ep]);
+        result_ids[0] = ep;
+        result_dists[0] = ep_dist;
+        is_expanded[0] = 0;
+        meta[0] = 1;
+        bitmap_visit(visited_bmap, ep);
+    }
+    __syncthreads();
+
+    // --- Seed with entry point's neighbors ---
+    if (threadIdx.x == 0)
+        meta[1] = 0;
+    __syncthreads();
+
+    for (int j = threadIdx.x; j < max_degree0; j += blockDim.x) {
+        uint32_t nbr =
+                d_layer0_graph[static_cast<int64_t>(ep) * max_degree0 + j];
+        if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N))
+            continue;
+        if (!bitmap_visit(visited_bmap, nbr))
+            continue;
+
+        const int32_t* nbr_packed =
+                reinterpret_cast<const int32_t*>(d_dataset + static_cast<int64_t>(nbr) * dim);
+        float dist = thread_ip_distance_dp4a(query, nbr_packed, dim4);
+        if (d_inv_norms)
+            dist *= d_inv_norms[nbr];
+
+        int slot = atomicAdd(&meta[1], 1);
+        if (slot < max_staging) {
+            staging_ids[slot] = nbr;
+            staging_dists[slot] = dist;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int staging_count = min(meta[1], max_staging);
+        int rc = meta[0];
+
+        for (int s = 0; s < staging_count; s++) {
+            uint32_t sid = staging_ids[s];
+            float sdist = staging_dists[s];
+            if (rc >= ef && sdist >= result_dists[rc - 1])
+                continue;
+
+            int lo = 0, hi = rc;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (result_dists[mid] < sdist)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            int insert_end = rc < ef ? rc : ef - 1;
+            for (int i = insert_end; i > lo; i--) {
+                result_ids[i] = result_ids[i - 1];
+                result_dists[i] = result_dists[i - 1];
+                is_expanded[i] = is_expanded[i - 1];
+            }
+            result_ids[lo] = sid;
+            result_dists[lo] = sdist;
+            is_expanded[lo] = 0;
+            if (rc < ef)
+                rc++;
+        }
+
+        for (int i = 0; i < rc; i++) {
+            if (result_ids[i] == ep) {
+                is_expanded[i] = 1;
+                break;
+            }
+        }
+        meta[0] = rc;
+    }
+    __syncthreads();
+
+    // --- Unified main loop ---
+    for (int iter = 0; iter < max_iterations; iter++) {
+        if (threadIdx.x == 0) {
+            int num_parents = 0;
+            int rc = meta[0];
+
+            for (int i = 0; i < rc && num_parents < search_width; i++) {
+                if (!is_expanded[i]) {
+                    parent_ids[num_parents++] = result_ids[i];
+                    is_expanded[i] = 1;
+                }
+            }
+
+            meta[2] = num_parents;
+        }
+        __syncthreads();
+
+        int num_parents = meta[2];
+        if (num_parents == 0)
+            break;
+
+        if (threadIdx.x == 0)
+            meta[1] = 0;
+        __syncthreads();
+
+        int total_work = num_parents * max_degree0;
+        for (int wi = threadIdx.x; wi < total_work; wi += blockDim.x) {
+            int parent_idx = wi / max_degree0;
+            int nbr_slot = wi % max_degree0;
+
+            uint32_t parent = parent_ids[parent_idx];
+            uint32_t nbr =
+                    d_layer0_graph
+                                  [static_cast<int64_t>(parent) * max_degree0 +
+                                   nbr_slot];
+            if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N))
+                continue;
+            if (!bitmap_visit(visited_bmap, nbr))
+                continue;
+
+            const int32_t* nbr_packed =
+                    reinterpret_cast<const int32_t*>(d_dataset + static_cast<int64_t>(nbr) * dim);
+            float dist = thread_ip_distance_dp4a(query, nbr_packed, dim4);
+            if (d_inv_norms)
+                dist *= d_inv_norms[nbr];
+
+            int slot = atomicAdd(&meta[1], 1);
+            if (slot < max_staging) {
+                staging_ids[slot] = nbr;
+                staging_dists[slot] = dist;
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            int staging_count = min(meta[1], max_staging);
+            int rc = meta[0];
+
+            for (int s = 0; s < staging_count; s++) {
+                uint32_t sid = staging_ids[s];
+                float sdist = staging_dists[s];
+                if (rc >= ef && sdist >= result_dists[rc - 1])
+                    continue;
+
+                int lo = 0, hi = rc;
+                while (lo < hi) {
+                    int mid = (lo + hi) / 2;
+                    if (result_dists[mid] < sdist)
+                        lo = mid + 1;
+                    else
+                        hi = mid;
+                }
+                int insert_end = rc < ef ? rc : ef - 1;
+                for (int i = insert_end; i > lo; i--) {
+                    result_ids[i] = result_ids[i - 1];
+                    result_dists[i] = result_dists[i - 1];
+                    is_expanded[i] = is_expanded[i - 1];
+                }
+                result_ids[lo] = sid;
+                result_dists[lo] = sdist;
+                is_expanded[lo] = 0;
+                if (rc < ef)
+                    rc++;
+            }
+
+            meta[0] = rc;
+        }
+        __syncthreads();
     }
 
     // --- Copy top-k results to global memory ---

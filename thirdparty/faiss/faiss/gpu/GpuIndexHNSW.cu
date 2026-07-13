@@ -287,5 +287,94 @@ void GpuIndexHNSW::searchHost(
     }
 }
 
+void GpuIndexHNSW::searchHostInt8(
+        idx_t n,
+        const int8_t* x_host,
+        int k,
+        float* distances_host,
+        idx_t* labels_host,
+        const GpuHnswSearchParams& sp) const {
+    FAISS_THROW_IF_NOT_MSG(
+            this->is_trained && deviceIndex_,
+            "Index not loaded. Call copyFrom() first.");
+    FAISS_THROW_IF_NOT_MSG(n > 0, "n must be > 0");
+
+    auto& idx = *deviceIndex_;
+    FAISS_THROW_IF_NOT_FMT(
+            idx.dim % 4 == 0,
+            "searchHostInt8: dim=%ld is not divisible by 4 (required for DP4A)",
+            idx.dim);
+
+    GPU_HNSW_CUDA_CHECK(cudaSetDevice(config_.device));
+    DeviceScope scope(config_.device);
+
+    ScratchPoolGuard guard(*idx.scratch_pool);
+    auto* slot = guard.get();
+    auto& sc = slot->scratch;
+    cudaStream_t stream = slot->stream;
+
+    int nq = static_cast<int>(n);
+    int dim = static_cast<int>(idx.dim);
+    int64_t nelem = static_cast<int64_t>(nq) * dim;
+
+    sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows), /*use_i8_queries=*/true);
+
+    // Apply +128 shift to queries to match upload_int8_dataset's -128 encoding.
+    // upload_int8_dataset stores: gpu_val = user_val - 128
+    // So query shift: shifted_q = user_q + 128 → same encoding as stored vectors.
+    auto shifted = std::make_unique<int8_t[]>(nelem);
+    for (int64_t i = 0; i < nelem; i++) {
+        shifted[i] = static_cast<int8_t>(static_cast<int>(x_host[i]) + 128);
+    }
+
+    // Upload shifted int8 queries to d_queries_i8 (for DP4A layer-0 kernel).
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
+            sc.d_queries_i8,
+            shifted.get(),
+            nelem * sizeof(int8_t),
+            cudaMemcpyHostToDevice,
+            stream));
+
+    // Also upload fp32 queries to d_queries for upper-layer greedy search.
+    auto fp32_q = std::make_unique<float[]>(nelem);
+    for (int64_t i = 0; i < nelem; i++) {
+        fp32_q[i] = static_cast<float>(x_host[i]);
+    }
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
+            sc.d_queries,
+            fp32_q.get(),
+            nelem * sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream));
+
+    // Synchronize to ensure host buffers (shifted, fp32_q) are not freed
+    // while the async copies are in flight.
+    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    gpu_hnsw_search(stream, sp, idx, sc, nq, k);
+
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
+            distances_host,
+            sc.d_distances,
+            static_cast<size_t>(nq) * k * sizeof(float),
+            cudaMemcpyDeviceToHost,
+            stream));
+
+    auto tmp = std::make_unique<uint64_t[]>(nq * k);
+    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
+            tmp.get(),
+            sc.d_neighbors,
+            static_cast<size_t>(nq) * k * sizeof(uint64_t),
+            cudaMemcpyDeviceToHost,
+            stream));
+
+    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    for (int i = 0; i < nq * k; i++) {
+        labels_host[i] =
+                (tmp[i] == UINT64_MAX) ? -1 : static_cast<idx_t>(tmp[i]);
+    }
+}
+
 } // namespace gpu
 } // namespace faiss

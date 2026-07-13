@@ -123,6 +123,18 @@ struct GpuIndexHNSW : public GpuIndex {
             idx_t* labels_host,
             const GpuHnswSearchParams& params) const;
 
+    /// Search with int8 host query vectors using the native DP4A path.
+    /// Applies +128 shift to queries to match upload_int8_dataset encoding
+    /// (which stores as value - 128). dim must be divisible by 4.
+    /// All input/output pointers must be host memory.
+    void searchHostInt8(
+            idx_t n,
+            const int8_t* x_host,
+            int k,
+            float* distances_host,
+            idx_t* labels_host,
+            const GpuHnswSearchParams& params) const;
+
    protected:
     bool addImplRequiresIDs_() const override;
 

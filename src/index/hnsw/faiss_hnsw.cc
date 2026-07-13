@@ -3341,6 +3341,11 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         : BaseFaissRegularIndexHNSWNode(version, object, DataFormatEnum::fp32) {
     }
 
+    // Constructor for native data-type variants (e.g. int8 DP4A path).
+    GpuHnswIndexNode(const int32_t& version, const Object& object, DataFormatEnum query_format)
+        : BaseFaissRegularIndexHNSWNode(version, object, query_format) {
+    }
+
     static std::unique_ptr<BaseConfig>
     StaticCreateConfig() {
         return std::make_unique<FaissHnswConfig>();
@@ -3554,6 +3559,53 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         auto nq = dataset->GetRows();
         auto dim = dataset->GetDim();
         auto ef = hnsw_cfg.ef.value_or(200);
+
+        auto h_ids = std::make_unique<int64_t[]>(nq * k);
+        auto h_dist = std::make_unique<float[]>(nq * k);
+
+        // Native int8 DP4A path: queries arrive as raw int8 (no MockWrapper upcast).
+        if (data_format == DataFormatEnum::int8) {
+            const auto* h_queries_i8 =
+                    reinterpret_cast<const int8_t*>(dataset->GetTensor());
+            try {
+                faiss::gpu::GpuHnswSearchParams gsp;
+                gsp.ef = ef;
+                gpu_snapshot->searchHostInt8(nq, h_queries_i8, k, h_dist.get(), h_ids.get(), gsp);
+            } catch (const std::exception& e) {
+                LOG_KNOWHERE_ERROR_ << "GPU_HNSW int8 search failed: " << e.what();
+                return expected<DataSetPtr>::Err(Status::cuvs_inner_error,
+                                                 std::string("GPU HNSW int8 search failed: ") + e.what());
+            }
+
+            // For COSINE, post-scale distances by 1/||q|| so scores are in [-1, 1].
+            // The kernel computes -dot(shifted_q, shifted_db) which equals the
+            // unscaled negative cosine numerator; divide by query norm to finalize.
+            if (IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE)) {
+                for (int64_t i = 0; i < static_cast<int64_t>(nq); i++) {
+                    const int8_t* q = h_queries_i8 + i * dim;
+                    int32_t sq_norm = 0;
+                    for (int64_t d = 0; d < static_cast<int64_t>(dim); d++) {
+                        sq_norm += static_cast<int32_t>(q[d]) * static_cast<int32_t>(q[d]);
+                    }
+                    float inv_qnorm = (sq_norm > 0) ? (1.0f / std::sqrt(static_cast<float>(sq_norm))) : 1.0f;
+                    for (int64_t j = 0; j < static_cast<int64_t>(k); j++) {
+                        h_dist[i * k + j] *= inv_qnorm;
+                    }
+                }
+            }
+
+            // Negate back to positive for IP and COSINE.
+            if (IsMetricType(hnsw_cfg.metric_type.value(), metric::IP) ||
+                IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE)) {
+                for (int64_t i = 0; i < static_cast<int64_t>(nq * k); i++) {
+                    h_dist[i] = -h_dist[i];
+                }
+            }
+
+            return GenResultDataSet(nq, k, h_ids.release(), h_dist.release());
+        }
+
+        // fp32 path (fp16/bf16 have already been upcast by MockWrapper).
         const auto* h_queries_raw = reinterpret_cast<const float*>(dataset->GetTensor());
 
         // For COSINE metric, normalize queries to unit length.
@@ -3571,9 +3623,6 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
             }
             h_queries = normalized_queries.get();
         }
-
-        auto h_ids = std::make_unique<int64_t[]>(nq * k);
-        auto h_dist = std::make_unique<float[]>(nq * k);
 
         try {
             faiss::gpu::GpuHnswSearchParams gsp;
@@ -3694,6 +3743,10 @@ class GpuHnswSQIndexNode : public GpuHnswIndexNode {
     GpuHnswSQIndexNode(const int32_t& version, const Object& object) : GpuHnswIndexNode(version, object) {
     }
 
+    GpuHnswSQIndexNode(const int32_t& version, const Object& object, DataFormatEnum query_format)
+        : GpuHnswIndexNode(version, object, query_format) {
+    }
+
     std::string
     Type() const override {
         return IndexEnum::INDEX_GPU_HNSW_SQ;
@@ -3739,7 +3792,9 @@ KNOWHERE_REGISTER_GLOBAL(
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) {
-        return Index<IndexNodeDataMockWrapper<int8>>::Create(std::make_unique<GpuHnswIndexNode>(version, object));
+        // Native int8 path: bypass MockWrapper upcast, pass int8 queries directly
+        // to searchHostInt8() which applies the +128 shift and uses DP4A kernel.
+        return Index<GpuHnswIndexNode>::Create(version, object, DataFormatEnum::int8);
     },
     int8, true, (feature::INT8 | feature::GPU));
 
@@ -3765,7 +3820,9 @@ KNOWHERE_REGISTER_GLOBAL(
 KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
     [](const int32_t& version, const Object& object) {
-        return Index<IndexNodeDataMockWrapper<int8>>::Create(std::make_unique<GpuHnswSQIndexNode>(version, object));
+        // Native int8 path: bypass MockWrapper upcast, pass int8 queries directly
+        // to searchHostInt8() which applies the +128 shift and uses DP4A kernel.
+        return Index<GpuHnswSQIndexNode>::Create(version, object, DataFormatEnum::int8);
     },
     int8, true, (feature::INT8 | feature::GPU));
 #endif  // KNOWHERE_WITH_CUVS

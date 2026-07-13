@@ -188,6 +188,112 @@ inline void gpu_hnsw_search(
 
     switch (idx.dataset_type) {
         case GpuHnswDatasetType::INT8:
+            // Use the DP4A native int8 kernel when int8 queries are available.
+            if (sc.d_queries_i8 != nullptr) {
+                // Upper-layer greedy search still uses fp32 queries (d_queries).
+                if (num_upper_layers > 0) {
+                    auto* d_layer_ptrs = static_cast<hnsw_kernel::upper_layer_ptrs*>(
+                            idx.d_upper_layer_ptrs);
+                    int warps_per_block = 4;
+                    int threads_per_block = warps_per_block * 32;
+                    int num_blocks =
+                            (num_queries + warps_per_block - 1) / warps_per_block;
+                    hnsw_kernel::upper_layer_search_kernel<int8_t>
+                            <<<num_blocks, threads_per_block, 0, stream>>>(
+                                    sc.d_queries,
+                                    static_cast<const int8_t*>(idx.d_dataset),
+                                    idx.d_inv_norms,
+                                    d_layer_ptrs,
+                                    sc.d_entry_points,
+                                    idx.entry_point,
+                                    num_queries,
+                                    dim,
+                                    num_upper_layers,
+                                    idx.use_ip);
+                    GPU_HNSW_CUDA_CHECK(cudaGetLastError());
+                } else {
+                    std::vector<uint32_t> h_eps(num_queries, idx.entry_point);
+                    GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
+                            sc.d_entry_points,
+                            h_eps.data(),
+                            num_queries * sizeof(uint32_t),
+                            cudaMemcpyHostToDevice,
+                            stream));
+                    GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
+
+                int block_size =
+                        params.thread_block_size > 0 ? params.thread_block_size : 128;
+
+                int smem_max = 49152;
+                {
+                    int device = 0;
+                    int optin = 0;
+                    if (cudaGetDevice(&device) == cudaSuccess &&
+                        cudaDeviceGetAttribute(
+                                &optin,
+                                cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                device) == cudaSuccess &&
+                        optin > smem_max) {
+                        smem_max = optin;
+                    }
+                }
+
+                {
+                    int smem_overhead = sw * idx.max_degree0 * 8 + sw * 4 + 12;
+                    int max_ef = (smem_max - smem_overhead) / 12;
+                    if (max_ef < 1) {
+                        throw std::runtime_error(
+                                std::string("gpu_hnsw: search_width=") +
+                                std::to_string(sw) +
+                                " too large for device shared memory (" +
+                                std::to_string(smem_max) +
+                                " bytes); reduce search_width");
+                    }
+                    if (ef > max_ef) {
+                        ef = max_ef;
+                    }
+                }
+
+                size_t smem_size = hnsw_kernel::calc_layer0_smem_size(
+                        ef, sw, idx.max_degree0);
+
+                if (smem_size > 49152) {
+                    GPU_HNSW_CUDA_CHECK(cudaFuncSetAttribute(
+                            hnsw_kernel::layer0_beam_search_kernel_int8,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            static_cast<int>(smem_size)));
+                }
+
+                int N_int = static_cast<int>(idx.n_rows);
+                size_t bitmap_bytes = hnsw_kernel::calc_visited_bitmap_size(
+                        num_queries, N_int);
+                GPU_HNSW_CUDA_CHECK(cudaMemsetAsync(
+                        sc.d_visited_bitmaps, 0, bitmap_bytes, stream));
+
+                hnsw_kernel::layer0_beam_search_kernel_int8
+                        <<<num_queries, block_size, smem_size, stream>>>(
+                                reinterpret_cast<const int32_t*>(sc.d_queries_i8),
+                                static_cast<const int8_t*>(idx.d_dataset),
+                                idx.d_inv_norms,
+                                idx.d_layer0_graph,
+                                sc.d_entry_points,
+                                sc.d_visited_bitmaps,
+                                sc.d_neighbors,
+                                sc.d_distances,
+                                num_queries,
+                                N_int,
+                                dim,
+                                idx.max_degree0,
+                                k,
+                                ef,
+                                sw,
+                                max_iter,
+                                idx.use_ip);
+                GPU_HNSW_CUDA_CHECK(cudaGetLastError());
+                break;
+            }
+            // Fall through to generic int8 fp32-query path if no i8 queries.
             launch_kernels(
                     static_cast<const int8_t*>(idx.d_dataset), idx.d_inv_norms);
             break;
