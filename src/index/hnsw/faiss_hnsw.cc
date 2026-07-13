@@ -3369,13 +3369,16 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         // The on-disk index for this collection is the compact FAISS int8-SQ
         // form (IndexHNSWSQCosine: signed-int8 codes + graph), the SAME form the
         // CPU HNSW cluster loads resident at ~file_size. Deserialize reads it
-        // into host RAM at ~file_size (no fp32 expansion — the int8 codes are
-        // uploaded to the device directly, so there is NO fp32 reconstruct/decode
-        // staging on this path). The transient peak is therefore dominated by the
-        // serialized read buffer plus the deserialized compact index, ~2x the
-        // on-disk file size — not the fp32 rows*dim*4 blowup that a Flat/hnswlib
-        // path would incur. Basing the estimate on file_size also avoids relying
-        // on num_rows/dim, which can arrive as 0 at estimate time.
+        // into host RAM at ~file_size. For native int8/fp16/bf16 upload paths
+        // the codes are uploaded to the device directly with no fp32
+        // reconstruct/decode staging. (Note: unsigned SQ8 via QT_8bit does call
+        // sa_decode() into a float buffer, so that path would incur fp32
+        // staging — but it is not used in production GPU HNSW loads here.)
+        // The transient peak is therefore dominated by the serialized read
+        // buffer plus the deserialized compact index, ~2x the on-disk file
+        // size — not the fp32 rows*dim*4 blowup that a Flat/hnswlib path would
+        // incur. Basing the estimate on file_size also avoids relying on
+        // num_rows/dim, which can arrive as 0 at estimate time.
         (void)num_rows;
         (void)dim;
         (void)config;
