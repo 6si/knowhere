@@ -225,7 +225,7 @@ inline void gpu_hnsw_search(
                 int block_size =
                         params.thread_block_size > 0 ? params.thread_block_size : 128;
 
-                int smem_max = 49152;
+                int smem_max_i8 = 49152;
                 {
                     int device = 0;
                     int optin = 0;
@@ -234,20 +234,20 @@ inline void gpu_hnsw_search(
                                 &optin,
                                 cudaDevAttrMaxSharedMemoryPerBlockOptin,
                                 device) == cudaSuccess &&
-                        optin > smem_max) {
-                        smem_max = optin;
+                        optin > smem_max_i8) {
+                        smem_max_i8 = optin;
                     }
                 }
 
                 {
                     int smem_overhead = sw * idx.max_degree0 * 8 + sw * 4 + 12;
-                    int max_ef = (smem_max - smem_overhead) / 12;
+                    int max_ef = (smem_max_i8 - smem_overhead) / 12;
                     if (max_ef < 1) {
                         throw std::runtime_error(
-                                std::string("gpu_hnsw: search_width=") +
+                                std::string("gpu_hnsw_int8: search_width=") +
                                 std::to_string(sw) +
                                 " too large for device shared memory (" +
-                                std::to_string(smem_max) +
+                                std::to_string(smem_max_i8) +
                                 " bytes); reduce search_width");
                     }
                     if (ef > max_ef) {
@@ -255,14 +255,14 @@ inline void gpu_hnsw_search(
                     }
                 }
 
-                size_t smem_size = hnsw_kernel::calc_layer0_smem_size(
+                size_t smem_size_i8 = hnsw_kernel::calc_layer0_smem_size(
                         ef, sw, idx.max_degree0);
 
-                if (smem_size > 49152) {
+                if (smem_size_i8 > 49152) {
                     GPU_HNSW_CUDA_CHECK(cudaFuncSetAttribute(
                             hnsw_kernel::layer0_beam_search_kernel_int8,
                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            static_cast<int>(smem_size)));
+                            static_cast<int>(smem_size_i8)));
                 }
 
                 int N_int = static_cast<int>(idx.n_rows);
@@ -272,7 +272,7 @@ inline void gpu_hnsw_search(
                         sc.d_visited_bitmaps, 0, bitmap_bytes, stream));
 
                 hnsw_kernel::layer0_beam_search_kernel_int8
-                        <<<num_queries, block_size, smem_size, stream>>>(
+                        <<<num_queries, block_size, smem_size_i8, stream>>>(
                                 reinterpret_cast<const int32_t*>(sc.d_queries_i8),
                                 static_cast<const int8_t*>(idx.d_dataset),
                                 idx.d_inv_norms,
