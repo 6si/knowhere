@@ -79,8 +79,9 @@ __device__ __forceinline__ float thread_ip_distance(
 }
 
 // DP4A inner-product distance for int8 queries vs int8 dataset.
-// Both query and vec must already be in the same encoding (both shifted +128
-// relative to the user's signed int8 values, matching upload_int8_dataset).
+// Both query and dataset must be in the same encoding: signed int8 user values.
+// Dataset is stored as-is (upload_int8_dataset reverses FAISS's +128 bias).
+// Queries are passed without any shift (user signed int8 values directly).
 // Computes -dot(query, vec) as a float (max-IP / negative dot convention).
 // dim4 = dim / 4 (caller must ensure dim % 4 == 0).
 __device__ __forceinline__ float thread_ip_distance_dp4a(
@@ -496,8 +497,9 @@ __global__ void layer0_beam_search_kernel(
 // ============================================================================
 // Phase 2 (int8/DP4A variant): Layer-0 parallel beam search kernel
 // Uses __dp4a for 4x int8 MADs per cycle instead of fp32 FMA.
-// d_queries_packed: int8 queries reinterpreted as int32 (shifted +128 to
-//   match upload_int8_dataset encoding); dim must be divisible by 4.
+// d_queries_packed: int8 queries reinterpreted as int32 (signed user values,
+//   no shift — matches dataset encoding after upload_int8_dataset -128 reversal);
+//   dim must be divisible by 4.
 // d_dataset: raw int8 dataset on device (already shifted -128 at upload time,
 //   now consistent with query shift so DP4A computes the correct dot product).
 // ============================================================================
@@ -560,11 +562,9 @@ __global__ void layer0_beam_search_kernel_int8(
     if (threadIdx.x == 0) {
         const int32_t* ep_packed =
                 reinterpret_cast<const int32_t*>(d_dataset + static_cast<int64_t>(ep) * dim);
+        // DP4A kernel is only dispatched for IP/COSINE (use_ip=true); L2
+        // falls back to the fp32 kernel before this point.
         float ep_dist = thread_ip_distance_dp4a(query, ep_packed, dim4);
-        if (!use_inner_product) {
-            // L2 fallback: should not happen for int8 DP4A path, but guard
-            ep_dist = ep_dist;  // keep as-is (ip convention, distance is valid)
-        }
         if (d_inv_norms)
             ep_dist *= __ldg(&d_inv_norms[ep]);
         result_ids[0] = ep;

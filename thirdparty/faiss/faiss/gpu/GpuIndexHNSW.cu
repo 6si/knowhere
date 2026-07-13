@@ -300,10 +300,16 @@ void GpuIndexHNSW::searchHostInt8(
     FAISS_THROW_IF_NOT_MSG(n > 0, "n must be > 0");
 
     auto& idx = *deviceIndex_;
-    FAISS_THROW_IF_NOT_FMT(
-            idx.dim % 4 == 0,
-            "searchHostInt8: dim=%ld is not divisible by 4 (required for DP4A)",
-            idx.dim);
+    // If dim is not divisible by 4, DP4A cannot be used; fall back to fp32 path.
+    if (idx.dim % 4 != 0) {
+        auto fp32_fallback = std::make_unique<float[]>(
+                static_cast<size_t>(n) * idx.dim);
+        for (int64_t i = 0; i < static_cast<int64_t>(n) * idx.dim; i++) {
+            fp32_fallback[i] = static_cast<float>(x_host[i]);
+        }
+        searchHost(n, fp32_fallback.get(), k, distances_host, labels_host, sp);
+        return;
+    }
 
     GPU_HNSW_CUDA_CHECK(cudaSetDevice(config_.device));
     DeviceScope scope(config_.device);
@@ -319,18 +325,13 @@ void GpuIndexHNSW::searchHostInt8(
 
     sc.ensure(nq, k, dim, static_cast<int>(idx.n_rows), /*use_i8_queries=*/true);
 
-    // Apply +128 shift to queries to match upload_int8_dataset's -128 encoding.
-    // upload_int8_dataset stores: gpu_val = user_val - 128
-    // So query shift: shifted_q = user_q + 128 → same encoding as stored vectors.
-    auto shifted = std::make_unique<int8_t[]>(nelem);
-    for (int64_t i = 0; i < nelem; i++) {
-        shifted[i] = static_cast<int8_t>(static_cast<int>(x_host[i]) + 128);
-    }
-
-    // Upload shifted int8 queries to d_queries_i8 (for DP4A layer-0 kernel).
+    // Upload int8 queries directly — dataset on GPU is already in signed int8
+    // (upload_int8_dataset applies codes[i]-128, reversing FAISS's +128 bias,
+    // yielding the original signed user values). Queries arrive as the same
+    // signed int8 user values; no shift is needed.
     GPU_HNSW_CUDA_CHECK(cudaMemcpyAsync(
             sc.d_queries_i8,
-            shifted.get(),
+            x_host,
             nelem * sizeof(int8_t),
             cudaMemcpyHostToDevice,
             stream));
@@ -347,7 +348,7 @@ void GpuIndexHNSW::searchHostInt8(
             cudaMemcpyHostToDevice,
             stream));
 
-    // Synchronize to ensure host buffers (shifted, fp32_q) are not freed
+    // Synchronize to ensure host buffers (fp32_q) are not freed
     // while the async copies are in flight.
     GPU_HNSW_CUDA_CHECK(cudaStreamSynchronize(stream));
 

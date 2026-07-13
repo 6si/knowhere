@@ -188,8 +188,10 @@ inline void gpu_hnsw_search(
 
     switch (idx.dataset_type) {
         case GpuHnswDatasetType::INT8:
-            // Use the DP4A native int8 kernel when int8 queries are available.
-            if (sc.d_queries_i8 != nullptr) {
+            // Use the DP4A native int8 kernel when int8 queries are available
+            // and the metric is IP/COSINE. L2 falls through to the fp32 path
+            // because the DP4A kernel only computes dot products, not L2 distances.
+            if (sc.d_queries_i8 != nullptr && idx.use_ip) {
                 // Upper-layer greedy search still uses fp32 queries (d_queries).
                 if (num_upper_layers > 0) {
                     auto* d_layer_ptrs = static_cast<hnsw_kernel::upper_layer_ptrs*>(
