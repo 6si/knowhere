@@ -27,6 +27,7 @@ namespace {
 constexpr const CFG_INT::value_type kSearchWidth = 1;
 constexpr const CFG_INT::value_type kAlignFactor = 32;
 constexpr const CFG_INT::value_type kItopkSize = 64;
+constexpr const CFG_INT::value_type kCagraEfMinValue = 16;
 }  // namespace
 
 struct GpuCuvsCagraConfig : public BaseConfig {
@@ -40,6 +41,7 @@ struct GpuCuvsCagraConfig : public BaseConfig {
     CFG_STRING search_algo;
     CFG_INT team_size;
     CFG_INT search_width;
+    CFG_INT num_random_samplings;
     CFG_INT min_iterations;
     CFG_INT max_iterations;
     CFG_INT thread_block_size;
@@ -47,7 +49,6 @@ struct GpuCuvsCagraConfig : public BaseConfig {
     CFG_INT hashmap_min_bitlen;
     CFG_FLOAT hashmap_max_fill_rate;
     CFG_INT nn_descent_niter;
-    CFG_INT num_random_samplings;
     CFG_BOOL adapt_for_cpu;
     CFG_INT ef;
     CFG_BOOL persistent;
@@ -88,6 +89,11 @@ struct GpuCuvsCagraConfig : public BaseConfig {
             .description("nodes to select as starting point in each iteration")
             .allow_empty_without_default()
             .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(num_random_samplings)
+            .description("number of random seed samplings")
+            .set_default(1)
+            .set_range(1, std::numeric_limits<CFG_INT::value_type>::max())
+            .for_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(min_iterations)
             .description("minimum number of search iterations")
             .set_default(0)
@@ -111,11 +117,6 @@ struct GpuCuvsCagraConfig : public BaseConfig {
             .description("number of iterations for NN descent")
             .set_default(20)
             .for_train();
-        KNOWHERE_CONFIG_DECLARE_FIELD(num_random_samplings)
-            .description("number of initial random seed node sampling iterations")
-            .set_default(1)
-            .set_range(1, std::numeric_limits<CFG_INT::value_type>::max())
-            .for_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(adapt_for_cpu)
             .description("train on GPU search on CPU")
             .set_default(false)
@@ -157,6 +158,15 @@ struct GpuCuvsCagraConfig : public BaseConfig {
             } else {
                 search_width = std::max((k.value() - 1) / kAlignFactor + 1, kSearchWidth);
             }
+
+            // Default ef for adapt_for_cpu HNSW search path
+            if (!ef.has_value()) {
+                ef = std::max(k.value(), kCagraEfMinValue);
+            } else if (k.value() > ef.value()) {
+                std::string msg =
+                    "ef(" + std::to_string(ef.value()) + ") should be larger than k(" + std::to_string(k.value()) + ")";
+                return HandleError(err_msg, msg, Status::out_of_range_in_json);
+            }
         }
         return Status::success;
     }
@@ -179,6 +189,7 @@ to_cuvs_knowhere_config(GpuCuvsCagraConfig const& cfg) {
     result.search_algo = cfg.search_algo;
     result.team_size = cfg.team_size;
     result.search_width = cfg.search_width;
+    result.num_random_samplings = cfg.num_random_samplings;
     result.min_iterations = cfg.min_iterations;
     result.max_iterations = cfg.max_iterations;
     result.thread_block_size = cfg.thread_block_size;
@@ -186,7 +197,6 @@ to_cuvs_knowhere_config(GpuCuvsCagraConfig const& cfg) {
     result.hashmap_min_bitlen = cfg.hashmap_min_bitlen;
     result.hashmap_max_fill_rate = cfg.hashmap_max_fill_rate;
     result.nn_descent_niter = cfg.nn_descent_niter;
-    result.num_random_samplings = cfg.num_random_samplings;
     result.persistent = cfg.persistent;
 
     return result;
