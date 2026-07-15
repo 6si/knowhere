@@ -114,8 +114,9 @@ struct check_valid_entry {
 // [-1, 1]) toward 0, so the graph ends up built on ~zero vectors. Instead cast
 // int8 -> float, L2-normalize per row in float, then rescale by 127 (the int8
 // max) and round back to int8. Every stored vector then has ~equal L2 norm, so
-// ranking by InnerProduct matches ranking by cosine. (Reported scores are
-// ~127^2 * cosine, i.e. large, but the ordering/recall is correct.)
+// ranking by InnerProduct matches ranking by cosine. Raw InnerProduct scores
+// are then ~127^2 * cosine; the search path divides them back down by 127^2 so
+// reported COSINE distances are true cosine in [-1, 1].
 struct int8_to_float_op {
     __device__ float
     operator()(std::int8_t x) const {
@@ -125,9 +126,24 @@ struct int8_to_float_op {
 struct float_to_int8_scaled_op {
     __device__ std::int8_t
     operator()(float v) const {
+        // A zero (or degenerate) input row L2-normalizes to NaN; map it back to
+        // a zero vector instead of relying on implementation-defined NaN clamping.
+        if (isnan(v)) {
+            return 0;
+        }
         float scaled = v * 127.0f;
         scaled = fminf(fmaxf(scaled, -127.0f), 127.0f);
         return static_cast<std::int8_t>(lrintf(scaled));
+    }
+};
+
+// Rescales InnerProduct scores computed over 127-scaled unit vectors back to
+// cosine (see normalize_int8_rows_for_cosine): score ~= 127^2 * cosine.
+struct int8_cosine_rescale_op {
+    float inv_factor;
+    __device__ float
+    operator()(float d) const {
+        return d * inv_factor;
     }
 };
 
@@ -232,17 +248,7 @@ build_algo_string_to_cagra_build_algo(std::string const& algo_string, int interm
                  cuvs::neighbors::cagra::graph_build_params::iterative_search_params>
         result = cuvs::neighbors::cagra::graph_build_params::ivf_pq_params();
     if (algo_string == "IVF_PQ") {
-        if (metric == cuvs::distance::DistanceType::CosineExpanded) {
-            // The pre-built libcuvs IVF_PQ knn-graph builder rejects CosineExpanded
-            // (cagra_build.cuh: "Currently only L2Expanded or InnerProduct metric are supported").
-            // NN_DESCENT supports CosineExpanded, so fall back to it for cosine builds.
-            auto nn_desc_params =
-                cuvs::neighbors::cagra::graph_build_params::nn_descent_params(intermediate_graph_degree, metric);
-            nn_desc_params.max_iterations = nn_descent_niter;
-            result = nn_desc_params;
-        } else {
-            result = cuvs::neighbors::cagra::graph_build_params::ivf_pq_params();
-        }
+        result = cuvs::neighbors::cagra::graph_build_params::ivf_pq_params();
     } else if (algo_string == "NN_DESCENT") {
         auto nn_desc_params =
             cuvs::neighbors::cagra::graph_build_params::nn_descent_params(intermediate_graph_degree, metric);
@@ -596,6 +602,21 @@ struct cuvs_knowhere_index<IndexKind, DataType>::impl {
                 return device_knowhere_ids_storage->view();
             }
         }();
+
+        // int8 COSINE stores 127-scaled unit vectors, so raw InnerProduct scores are
+        // ~127^2 * cosine. Rescale back to cosine before the invalid-entry post-process
+        // (which stamps sentinel max_distance and must not be scaled).
+        if constexpr (std::is_same_v<data_type, std::int8_t>) {
+            if (config.metric_type == knowhere::metric::COSINE) {
+                auto const inv_factor = 1.0f / (127.0f * 127.0f);
+                thrust::transform(raft::resource::get_thrust_policy(res),
+                                  thrust::device_ptr<knowhere_distance_type>(device_distances.data_handle()),
+                                  thrust::device_ptr<knowhere_distance_type>(device_distances.data_handle() +
+                                                                             device_distances.size()),
+                                  thrust::device_ptr<knowhere_distance_type>(device_distances.data_handle()),
+                                  int8_cosine_rescale_op{inv_factor});
+            }
+        }
 
         auto max_distance =
             std::nextafter(std::numeric_limits<knowhere_distance_type>::max(), knowhere_distance_type{0});
