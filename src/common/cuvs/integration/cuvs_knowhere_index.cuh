@@ -90,14 +90,17 @@ struct cuvs_index_type_mapper<true, cuvs_proto::cuvs_index_kind::cagra, DataType
 template <typename U, typename V>
 struct check_valid_entry {
     __device__ __host__
-    check_valid_entry(U max_distance, V max_id)
-        : max_distance_(max_distance), max_id_(max_id) {
+    check_valid_entry(U max_distance, V max_id, bool clamp_negative)
+        : max_distance_(max_distance), max_id_(max_id), clamp_negative_(clamp_negative) {
     }
     __device__ thrust::tuple<V, U>
     operator()(V id, U distance) {
         if (distance >= max_distance_ || id >= max_id_)
             return thrust::tuple<V, U>(V{-1}, distance);
-        if (distance < 0)
+        // Distance metrics (e.g. L2) are non-negative; a negative value is FP noise
+        // to squash. Similarity metrics (IP, COSINE) legitimately return negatives,
+        // so must not be clamped or every such score collapses to 0.
+        if (clamp_negative_ && distance < 0)
             return thrust::tuple<V, U>(id, U{0});
         return thrust::tuple<V, U>(id, distance);
     }
@@ -105,6 +108,7 @@ struct check_valid_entry {
  private:
     U max_distance_;
     V max_id_;
+    bool clamp_negative_;
 };
 
 }  // namespace detail
@@ -620,8 +624,12 @@ struct cuvs_knowhere_index<IndexKind, DataType>::impl {
 
         auto max_distance =
             std::nextafter(std::numeric_limits<knowhere_distance_type>::max(), knowhere_distance_type{0});
+        // IP/COSINE are similarity metrics whose scores can be negative; only clamp
+        // negative distances for non-similarity (distance) metrics such as L2.
+        auto const clamp_negative =
+            (config.metric_type != knowhere::metric::IP && config.metric_type != knowhere::metric::COSINE);
         auto device_post_process = detail::check_valid_entry<knowhere_distance_type, knowhere_indexing_type>{
-            max_distance, knowhere_indexing_type(size())};
+            max_distance, knowhere_indexing_type(size()), clamp_negative};
         thrust::transform(
             raft::resource::get_thrust_policy(res),
             thrust::device_ptr<knowhere_indexing_type>(device_knowhere_ids.data_handle()),
