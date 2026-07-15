@@ -415,6 +415,53 @@ TEST_CASE("Test All GPU Index", "[search]") {
         REQUIRE(recall > 0.65f);
     }
 
+    SECTION("Test Gpu Cagra Int8 Cosine Self Match") {
+        // Regression test for the int8 COSINE CAGRA path: a query equal to a
+        // stored row must score ~1.0 (true cosine), and every reported score
+        // must stay within [-1, 1]. This guards against (a) missing score
+        // rescale (self-match ~127^2 = 16129) and (b) an unnormalized index /
+        // wrong metric (scores > 16129, e.g. 22000-39000, L2-expanded range).
+        const int64_t self_nb = 2000;
+        const int64_t self_topk = 10;
+        auto name = knowhere::IndexEnum::INDEX_GPU_CAGRA;
+        if (knowhere::IndexFactory::Instance().FeatureCheck(name, knowhere::feature::INT8)) {
+            knowhere::Json json = cosine_gen(cagra_gen)();
+            json[knowhere::meta::TOPK] = self_topk;
+            auto cfg_json = json.dump();
+            CAPTURE(name, cfg_json);
+
+            auto train_ds = knowhere::ConvertToDataTypeIfNeeded<knowhere::int8>(GenDataSet(self_nb, dim, seed));
+            auto idx = knowhere::IndexFactory::Instance().Create<knowhere::int8>(name, version).value();
+            REQUIRE(idx.Build(train_ds, json) == knowhere::Status::success);
+
+            auto results = idx.Search(train_ds, json, nullptr);
+            REQUIRE(results.has_value());
+            auto ids = results.value()->GetIds();
+            auto dist = results.value()->GetDistance();
+
+            int self_match = 0;
+            for (int64_t i = 0; i < self_nb; ++i) {
+                if (ids[i * self_topk] == i) {
+                    ++self_match;
+                    // COSINE self-match must be ~1.0 (allow int8 requantization slack).
+                    CHECK(dist[i * self_topk] >= 0.9f);
+                }
+                for (int64_t j = 0; j < self_topk; ++j) {
+                    auto id = ids[i * self_topk + j];
+                    if (id == -1) {
+                        continue;
+                    }
+                    // True cosine is bounded; anything far outside [-1, 1] means
+                    // the rescale/normalization/metric is wrong.
+                    CHECK(dist[i * self_topk + j] <= 1.001f);
+                    CHECK(dist[i * self_topk + j] >= -1.001f);
+                }
+            }
+            // The overwhelming majority of rows must find themselves at top-1.
+            REQUIRE(self_match >= 0.95 * self_nb);
+        }
+    }
+
     SECTION("Test Gpu Index Search Hamming Metric") {
         using std::make_tuple;
         auto [name, gen] = GENERATE_REF(table<std::string, std::function<knowhere::Json()>>(
