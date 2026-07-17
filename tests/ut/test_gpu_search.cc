@@ -779,6 +779,84 @@ TEST_CASE("Test All GPU Index", "[search]") {
         // recall stays high but with a slightly looser floor.
         REQUIRE(recall >= 0.85f);
     }
+
+    SECTION("Test GPU HNSW non-power-of-two 2*M staging (fp32 + int8 DP4A)") {
+        // M=24 => max_degree0 = 2*M = 48, which is NOT a power of two. The
+        // parallel bitonic-merge kernel pads the layer-0 staging capacity up to
+        // the next power of two (64) and grows the block accordingly. Before the
+        // padding fix this configuration hard-failed every GPU search. Cover
+        // both the generic fp32-query kernel and the native int8 DP4A kernel
+        // (dim=128 is divisible by 4, so int8 COSINE takes the DP4A path).
+        const int64_t m = 24;
+
+        SECTION("fp32 cosine, non-pow2 2*M") {
+            knowhere::Json hnsw_json;
+            hnsw_json[knowhere::meta::DIM] = dim;
+            hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::COSINE;
+            hnsw_json[knowhere::meta::TOPK] = 10;
+            hnsw_json[knowhere::indexparam::HNSW_M] = m;
+            hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+            hnsw_json[knowhere::indexparam::EF] = 200;
+
+            auto train_ds = GenDataSet(nb, dim, seed);
+            auto query_ds = GenDataSet(nq, dim, seed + 2);
+
+            auto cpu_idx = knowhere::IndexFactory::Instance()
+                               .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version)
+                               .value();
+            REQUIRE(cpu_idx.Build(train_ds, hnsw_json) == knowhere::Status::success);
+
+            knowhere::BinarySet bs;
+            cpu_idx.Serialize(bs);
+
+            auto gpu_idx = knowhere::IndexFactory::Instance()
+                               .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                               .value();
+            REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+            auto results = gpu_idx.Search(query_ds, hnsw_json, nullptr);
+            REQUIRE(results.has_value());
+
+            auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, hnsw_json, nullptr);
+            REQUIRE(gt.has_value());
+            float recall = GetKNNRecall(*gt.value(), *results.value());
+            REQUIRE(recall >= 0.80f);
+        }
+
+        SECTION("int8 cosine DP4A, non-pow2 2*M") {
+            knowhere::Json hnsw_json;
+            hnsw_json[knowhere::meta::DIM] = dim;
+            hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::COSINE;
+            hnsw_json[knowhere::meta::TOPK] = 10;
+            hnsw_json[knowhere::indexparam::HNSW_M] = m;
+            hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+            hnsw_json[knowhere::indexparam::EF] = 200;
+
+            auto train_ds = knowhere::ConvertToDataTypeIfNeeded<knowhere::int8>(GenDataSet(nb, dim, seed));
+            auto query_ds = knowhere::ConvertToDataTypeIfNeeded<knowhere::int8>(GenDataSet(nq, dim, seed + 2));
+
+            auto cpu_idx = knowhere::IndexFactory::Instance()
+                               .Create<knowhere::int8>(knowhere::IndexEnum::INDEX_HNSW, version)
+                               .value();
+            REQUIRE(cpu_idx.Build(train_ds, hnsw_json) == knowhere::Status::success);
+
+            knowhere::BinarySet bs;
+            cpu_idx.Serialize(bs);
+
+            auto gpu_idx = knowhere::IndexFactory::Instance()
+                               .Create<knowhere::int8>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                               .value();
+            REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+            auto results = gpu_idx.Search(query_ds, hnsw_json, nullptr);
+            REQUIRE(results.has_value());
+
+            auto gt = knowhere::BruteForce::Search<knowhere::int8>(train_ds, query_ds, hnsw_json, nullptr);
+            REQUIRE(gt.has_value());
+            float recall = GetKNNRecall(*gt.value(), *results.value());
+            REQUIRE(recall >= 0.80f);
+        }
+    }
 }
 
 TEST_CASE("Test CPU vs GPU HNSW Comparison", "[gpu_hnsw_compare]") {

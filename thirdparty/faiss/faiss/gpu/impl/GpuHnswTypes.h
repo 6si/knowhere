@@ -96,7 +96,7 @@ struct GpuHnswSearchScratch {
     float* d_distances = nullptr;
     uint32_t* d_entry_points = nullptr;
     uint32_t* d_visited_bitmaps = nullptr;
-    int8_t* d_queries_i8 = nullptr;   // int8 queries for DP4A path (shifted +128)
+    int8_t* d_queries_i8 = nullptr; // int8 queries for the native DP4A path
 
     size_t queries_bytes = 0;
     size_t neighbors_bytes = 0;

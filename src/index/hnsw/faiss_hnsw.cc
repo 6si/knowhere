@@ -3384,6 +3384,19 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         // size — not the fp32 rows*dim*4 blowup that a Flat/hnswlib path would
         // incur. Basing the estimate on file_size also avoids relying on
         // num_rows/dim, which can arrive as 0 at estimate time.
+        //
+        // KNOWN LIMITATION: this 2x is correct for the native int8/fp16/bf16
+        // and int8-SQ upload paths (no fp32 staging). It UNDER-counts the two
+        // paths that materialize a full fp32 buffer during load — VECTOR_FLOAT
+        // IndexHNSWFlat (from_faiss_hnsw_flat does a reconstruct_n into a
+        // host float[]) and unsigned QT_8bit SQ8 (sa_decode into float) — whose
+        // true transient peak is closer to file_size + rows*dim*4. It is not
+        // corrected here because this static entry point receives no data-type
+        // discriminator (the same non-templated StaticEstimateLoadResource is
+        // registered for fp32/fp16/bf16/int8), so adding a blanket rows*dim*4
+        // term would badly over-reserve host RAM on the compact int8 path that
+        // production actually uses. Fixing it properly needs a per-DataType
+        // estimator; tracked as a follow-up.
         (void)num_rows;
         (void)dim;
         (void)config;

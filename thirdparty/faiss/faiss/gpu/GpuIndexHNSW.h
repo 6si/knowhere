@@ -30,11 +30,13 @@
 #include <memory>
 
 namespace faiss {
+
 namespace cppcontrib {
 namespace knowhere {
 struct IndexHNSW;
 } // namespace knowhere
 } // namespace cppcontrib
+
 namespace gpu {
 
 struct GpuHnswDeviceIndex;
@@ -93,7 +95,10 @@ struct GpuIndexHNSW : public GpuIndex {
     /// dequantized for other SQ types).
     void copyFrom(const faiss::cppcontrib::knowhere::IndexHNSW* index);
 
-    /// Load with explicit metric specification.
+    /// Like copyFrom(), but with the metric interpretation supplied by the
+    /// caller instead of being detected from the index type.
+    /// \param use_ip     treat the metric as inner product
+    /// \param is_cosine  the storage carries cosine (inverse L2) norms
     void copyFromWithMetric(
             const faiss::cppcontrib::knowhere::IndexHNSW* index,
             bool use_ip,
@@ -115,6 +120,11 @@ struct GpuIndexHNSW : public GpuIndex {
     /// This is the preferred entry point (single device sync); prefer it
     /// over the searchImpl_/GpuIndex::search() path, which round-trips the
     /// labels D2H then H2D.
+    ///
+    /// Distance convention: for inner-product and cosine metrics the returned
+    /// distances are the *negated* dot product (smaller == more similar), so
+    /// callers that want raw similarity scores must negate them (Knowhere does
+    /// this on the way out). L2 distances are returned as-is.
     void searchHost(
             idx_t n,
             const float* x_host,
@@ -124,9 +134,12 @@ struct GpuIndexHNSW : public GpuIndex {
             const GpuHnswSearchParams& params) const;
 
     /// Search with int8 host query vectors using the native DP4A path.
-    /// Applies +128 shift to queries to match upload_int8_dataset encoding
-    /// (which stores as value - 128). dim must be divisible by 4.
-    /// All input/output pointers must be host memory.
+    /// The queries are the caller's signed int8 values and are uploaded
+    /// verbatim — no bias/shift is applied, matching the dataset upload which
+    /// already reverses FAISS's +128 SQ bias. When dim % 4 != 0 (DP4A requires
+    /// groups of four int8 lanes) this transparently falls back to the fp32
+    /// searchHost() path. Same negated IP/cosine distance convention as
+    /// searchHost(). All input/output pointers must be host memory.
     void searchHostInt8(
             idx_t n,
             const int8_t* x_host,
