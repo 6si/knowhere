@@ -1486,4 +1486,122 @@ TEST_CASE("Test GPU HNSW Codex P1 Regressions", "[gpu_hnsw_p1]") {
         REQUIRE(GetKNNRecall(*gt.value(), *r_ok.value()) >= 0.8f);
     }
 }
+
+// ============================================================================
+// Full dtype x metric coverage for the GPU HNSW layer-0 search kernel.
+//
+// One TEST_CASE per dtype so each runs in its OWN process invocation (a CUDA
+// illegal-access in one kernel instantiation corrupts the context and aborts
+// the process; separate tags let the harness run every dtype independently and
+// still collect per-dtype results instead of losing everything after the first
+// crash). Every dtype is exercised for L2, IP and COSINE.
+//
+// All cases use the SAME config as the fp16 P1 regression that v82 OOBs on
+// (nb=4000, dim=64, M=16, ef=200) so the fp32 case below is the control: if
+// fp32 (the <float,float,false> kernel) is clean here while fp16
+// (<__half,float,false>) faults, the defect is specific to the low-precision
+// storage kernel; if fp32 also faults, it is config- rather than dtype-driven.
+// dim=64 is divisible by 4, so the int8 IP/COSINE cases take the DP4A path.
+namespace {
+constexpr int64_t kDtypeNb = 4000;
+constexpr int64_t kDtypeNq = 200;
+constexpr int64_t kDtypeDim = 64;
+constexpr int64_t kDtypeSeed = 42;
+constexpr int64_t kDtypeTopk = 10;
+
+knowhere::Json
+dtype_json(const std::string& metric, const std::string& sq_type) {
+    knowhere::Json json;
+    json[knowhere::meta::DIM] = kDtypeDim;
+    json[knowhere::meta::METRIC_TYPE] = metric;
+    json[knowhere::meta::TOPK] = kDtypeTopk;
+    json[knowhere::indexparam::HNSW_M] = 16;
+    json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+    json[knowhere::indexparam::EF] = 200;
+    if (!sq_type.empty()) {
+        json[knowhere::indexparam::SQ_TYPE] = sq_type;
+    }
+    return json;
+}
+
+// Build a CPU index of `index_type` on data type T, serialize, deserialize as
+// GPU_HNSW, search, and return recall vs a brute-force reference on T. Shared by
+// every per-dtype case so the only variables are the data type, the storage
+// index type and the metric.
+template <typename T>
+float
+gpu_dtype_recall(const std::string& index_type, const knowhere::Json& json, int version) {
+    auto train_ds = knowhere::ConvertToDataTypeIfNeeded<T>(GenDataSet(kDtypeNb, kDtypeDim, kDtypeSeed));
+    auto query_ds = knowhere::ConvertToDataTypeIfNeeded<T>(GenDataSet(kDtypeNq, kDtypeDim, kDtypeSeed + 2));
+
+    auto cpu_idx = knowhere::IndexFactory::Instance().Create<T>(index_type, version).value();
+    REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+    knowhere::BinarySet bs;
+    REQUIRE(cpu_idx.Serialize(bs) == knowhere::Status::success);
+
+    auto gpu_idx = knowhere::IndexFactory::Instance().Create<T>(knowhere::IndexEnum::INDEX_GPU_HNSW, version).value();
+    REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+    auto results = gpu_idx.Search(query_ds, json, nullptr);
+    REQUIRE(results.has_value());
+    auto gt = knowhere::BruteForce::Search<T>(train_ds, query_ds, json, nullptr);
+    REQUIRE(gt.has_value());
+    return GetKNNRecall(*gt.value(), *results.value());
+}
+}  // namespace
+
+// FP32 flat storage -> generic <float,float,false> kernel. The config control.
+TEST_CASE("GPU HNSW dtype: FP32 (L2/IP/COSINE)", "[gpu_hnsw_dtype_fp32]") {
+    const auto version = GenTestVersionList();
+    const auto metric = GENERATE(knowhere::metric::L2, knowhere::metric::IP, knowhere::metric::COSINE);
+    CAPTURE(metric);
+    float recall = gpu_dtype_recall<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""), version);
+    REQUIRE(recall >= 0.85f);
+}
+
+// FP16 native 2-byte storage -> <__half,float,false> kernel. Built via HNSW_SQ
+// on the fp32 node with SQ_TYPE=fp16 so the device selects the native half
+// representation (the path the mock-wrapper fp16 tests do NOT reach).
+TEST_CASE("GPU HNSW dtype: FP16 native (L2/IP/COSINE)", "[gpu_hnsw_dtype_fp16]") {
+    const auto version = GenTestVersionList();
+    const auto metric = GENERATE(knowhere::metric::L2, knowhere::metric::IP, knowhere::metric::COSINE);
+    CAPTURE(metric);
+    float recall =
+        gpu_dtype_recall<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW_SQ, dtype_json(metric, "fp16"), version);
+    REQUIRE(recall >= 0.85f);
+}
+
+// BF16 native 2-byte storage -> <__nv_bfloat16,float,false> kernel.
+TEST_CASE("GPU HNSW dtype: BF16 native (L2/IP/COSINE)", "[gpu_hnsw_dtype_bf16]") {
+    const auto version = GenTestVersionList();
+    const auto metric = GENERATE(knowhere::metric::L2, knowhere::metric::IP, knowhere::metric::COSINE);
+    CAPTURE(metric);
+    float recall =
+        gpu_dtype_recall<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW_SQ, dtype_json(metric, "bf16"), version);
+    // bf16 has a 7-bit mantissa (coarser than fp16); slightly looser floor.
+    REQUIRE(recall >= 0.80f);
+}
+
+// SQ8 storage -> decoded to fp32 on upload -> generic <float,float,false>
+// kernel (distinct from the native half/bf16 paths above).
+TEST_CASE("GPU HNSW dtype: SQ8 decoded (L2/IP/COSINE)", "[gpu_hnsw_dtype_sq8]") {
+    const auto version = GenTestVersionList();
+    const auto metric = GENERATE(knowhere::metric::L2, knowhere::metric::IP, knowhere::metric::COSINE);
+    CAPTURE(metric);
+    float recall =
+        gpu_dtype_recall<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW_SQ, dtype_json(metric, "sq8"), version);
+    // SQ8 is coarse (8-bit per component); conservative floor.
+    REQUIRE(recall >= 0.65f);
+}
+
+// INT8 native 1-byte storage. IP/COSINE with dim%4==0 take the DP4A kernel
+// (<int8_t,int8_t,true>); L2 takes the generic decoded path (<int8_t,float,
+// false>).
+TEST_CASE("GPU HNSW dtype: INT8 native (L2/IP/COSINE)", "[gpu_hnsw_dtype_int8]") {
+    const auto version = GenTestVersionList();
+    const auto metric = GENERATE(knowhere::metric::L2, knowhere::metric::IP, knowhere::metric::COSINE);
+    CAPTURE(metric);
+    float recall = gpu_dtype_recall<knowhere::int8>(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""), version);
+    REQUIRE(recall >= 0.85f);
+}
 #endif
