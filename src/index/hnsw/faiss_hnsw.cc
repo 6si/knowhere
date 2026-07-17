@@ -3472,12 +3472,20 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         UnpublishGpuIndexLocked();
 
         // Accept CPU-built HNSW (F32) or HNSW_SQ (quantized) binaries.
+        // The base loader reads the payload via binset.GetByName(Type()), so
+        // the incoming binary must be filed under *this* node's Type():
+        // INDEX_GPU_HNSW for the base node, INDEX_GPU_HNSW_SQ for the SQ
+        // subclass. Aliasing under a hardcoded INDEX_GPU_HNSW would make
+        // GPU_HNSW_SQ loads fail — the SQ loader looks up INDEX_GPU_HNSW_SQ and
+        // would find nothing.
         Status status;
-        if (!binset.Contains(IndexEnum::INDEX_GPU_HNSW)) {
+        const std::string self_key = Type();
+        if (!binset.Contains(self_key)) {
             BinarySet aliased = binset;
-            for (const char* key : {IndexEnum::INDEX_GPU_HNSW_SQ, IndexEnum::INDEX_HNSW_SQ, IndexEnum::INDEX_HNSW}) {
+            for (const char* key : {IndexEnum::INDEX_GPU_HNSW, IndexEnum::INDEX_GPU_HNSW_SQ,
+                                    IndexEnum::INDEX_HNSW_SQ, IndexEnum::INDEX_HNSW}) {
                 if (binset.Contains(key)) {
-                    aliased.Append(IndexEnum::INDEX_GPU_HNSW, binset.GetByName(key));
+                    aliased.Append(self_key, binset.GetByName(key));
                     break;
                 }
             }
@@ -3537,32 +3545,25 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
             std::unique_lock<std::mutex> lock(gpu_mutex_);
             gpu_snapshot = gpu_index_;
             if (!gpu_snapshot) {
-                const auto* faiss_idx = GetFaissHnswIndex();
-                if (!faiss_idx) {
+                if (GetFaissHnswIndex() == nullptr) {
                     return expected<DataSetPtr>::Err(Status::empty_index, "index not loaded");
                 }
-                try {
-                    const auto& hnsw_cfg = static_cast<const FaissHnswConfig&>(*cfg);
-                    bool is_cosine = IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE);
-                    bool use_ip = IsMetricType(hnsw_cfg.metric_type.value(), metric::IP) || is_cosine;
-
-                    std::shared_ptr<faiss::gpu::GpuIndexHNSW> local;
-                    {
-                        std::lock_guard<std::mutex> gpu_ctor_lock(GetGpuConstructionMutex());
-                        gpu_resources_ = GetSharedGpuResources();
-                        local = std::make_shared<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
-                                                                           faiss_idx->metric_type);
-                    }
-                    local->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
-                    gpu_ntotal_ = faiss_idx->ntotal;
-                    gpu_dim_ = faiss_idx->d;
-                    const_cast<std::shared_ptr<faiss::Index>&>(indexes[0]).reset();
-                    gpu_index_ = local;
-                    gpu_ready_.store(true, std::memory_order_release);
-                    gpu_snapshot = local;
-                } catch (const std::exception& e) {
+                // Reuse the eager upload path (it holds no lock itself and we
+                // already hold gpu_mutex_). This keeps metric detection
+                // identical to Deserialize()/DeserializeFromFile(): the metric
+                // is derived from the FAISS index type (dynamic_cast for cosine,
+                // metric_type for IP), NOT from the query config. Detecting from
+                // config here was a latent bug — a search whose config omits
+                // metric_type would default to L2 and silently run a cosine/IP
+                // index with the wrong metric.
+                Status upload_status = UploadCpuIndexToGpuLocked();
+                if (upload_status != Status::success) {
                     return expected<DataSetPtr>::Err(Status::cuvs_inner_error,
-                                                     std::string("failed to build GPU HNSW index: ") + e.what());
+                                                     "failed to build GPU HNSW index");
+                }
+                gpu_snapshot = gpu_index_;
+                if (!gpu_snapshot) {
+                    return expected<DataSetPtr>::Err(Status::empty_index, "index not loaded");
                 }
             }
         }
@@ -3590,9 +3591,11 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                                                  std::string("GPU HNSW int8 search failed: ") + e.what());
             }
 
-            // For COSINE, post-scale distances by 1/||q|| so scores are in [-1, 1].
-            // The kernel computes -dot(shifted_q, shifted_db) which equals the
-            // unscaled negative cosine numerator; divide by query norm to finalize.
+            // For COSINE, post-scale distances by 1/||q|| so scores are in
+            // [-1, 1]. The kernel returns dot(shifted_q, shifted_db) * (1/||db||)
+            // (the true cosine numerator scaled by the db inverse norm, already
+            // sign-corrected to "larger == closer"); dividing by the query norm
+            // finalizes the cosine similarity.
             if (IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE)) {
                 for (int64_t i = 0; i < static_cast<int64_t>(nq); i++) {
                     const int8_t* q = h_queries_i8 + i * dim;
@@ -3607,14 +3610,10 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                 }
             }
 
-            // Negate back to positive for IP and COSINE.
-            if (IsMetricType(hnsw_cfg.metric_type.value(), metric::IP) ||
-                IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE)) {
-                for (int64_t i = 0; i < static_cast<int64_t>(nq * k); i++) {
-                    h_dist[i] = -h_dist[i];
-                }
-            }
-
+            // No sign flip: faiss now returns the true similarity for IP/COSINE
+            // (larger == closer), negating its internal min-first score on
+            // copy-out. Previously the kernel returned the negated score and
+            // this path flipped it back.
             return GenResultDataSet(nq, k, h_ids.release(), h_dist.release());
         }
 
@@ -3647,14 +3646,8 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                                              std::string("GPU HNSW search failed: ") + e.what());
         }
 
-        // Negate back to positive for IP and COSINE.
-        if (IsMetricType(hnsw_cfg.metric_type.value(), metric::IP) ||
-            IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE)) {
-            for (int64_t i = 0; i < static_cast<int64_t>(nq * k); i++) {
-                h_dist[i] = -h_dist[i];
-            }
-        }
-
+        // No sign flip: faiss now returns the true similarity for IP/COSINE
+        // (larger == closer), negating its internal min-first score on copy-out.
         return GenResultDataSet(nq, k, h_ids.release(), h_dist.release());
     }
 
@@ -3678,7 +3671,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     // (Milvus mmap/file load path) so both entrypoints upload identically. A
     // no-op success when there is no CPU index to upload (empty segment).
     Status
-    UploadCpuIndexToGpuLocked() {
+    UploadCpuIndexToGpuLocked() const {
         const auto* faiss_idx = GetFaissHnswIndex();
         if (faiss_idx == nullptr) {
             return Status::success;
@@ -3704,8 +3697,10 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
             gpu_ntotal_ = faiss_idx->ntotal;
             gpu_dim_ = faiss_idx->d;
             // Release CPU copy — vectors and graph are now on GPU. This is what
-            // drops the transient host-RAM peak back to ~0.
-            indexes[0].reset();
+            // drops the transient host-RAM peak back to ~0. const_cast because
+            // this helper is const (reused from the const Search() lazy path);
+            // it only frees the now-uploaded host copy.
+            const_cast<std::shared_ptr<faiss::Index>&>(indexes[0]).reset();
             // Publish last: Search() takes a locked snapshot of gpu_index_, and
             // gpu_ready_ is released for the lock-free Count()/Dim() readers.
             gpu_index_ = local;
@@ -3806,7 +3801,9 @@ KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW,
     [](const int32_t& version, const Object& object) {
         // Native int8 path: bypass MockWrapper upcast, pass int8 queries directly
-        // to searchHostInt8() which applies the +128 shift and uses DP4A kernel.
+        // to searchHostInt8(), which uploads the signed int8 queries verbatim (no
+        // +128 shift; the dataset upload already reverses FAISS's +128 SQ bias)
+        // and uses the DP4A kernel.
         return Index<GpuHnswIndexNode>::Create(version, object, DataFormatEnum::int8);
     },
     int8, true, (feature::INT8 | feature::GPU));
@@ -3834,7 +3831,9 @@ KNOWHERE_REGISTER_GLOBAL(
     GPU_HNSW_SQ,
     [](const int32_t& version, const Object& object) {
         // Native int8 path: bypass MockWrapper upcast, pass int8 queries directly
-        // to searchHostInt8() which applies the +128 shift and uses DP4A kernel.
+        // to searchHostInt8(), which uploads the signed int8 queries verbatim (no
+        // +128 shift; the dataset upload already reverses FAISS's +128 SQ bias)
+        // and uses the DP4A kernel.
         return Index<GpuHnswSQIndexNode>::Create(version, object, DataFormatEnum::int8);
     },
     int8, true, (feature::INT8 | feature::GPU));

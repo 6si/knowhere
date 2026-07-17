@@ -13,6 +13,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1603,5 +1604,144 @@ TEST_CASE("GPU HNSW dtype: INT8 native (L2/IP/COSINE)", "[gpu_hnsw_dtype_int8]")
     CAPTURE(metric);
     float recall = gpu_dtype_recall<knowhere::int8>(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""), version);
     REQUIRE(recall >= 0.85f);
+}
+
+// v84 regression: a CPU HNSW_SQ index must load into the *GPU_HNSW_SQ* node.
+// GpuHnswSQIndexNode inherits Deserialize from GpuHnswIndexNode, which re-files
+// the incoming payload under this node's own Type(). The SQ node's Type() is
+// INDEX_GPU_HNSW_SQ and the base loader reads the payload via
+// GetByName(Type()); the pre-v84 code aliased under a hardcoded
+// INDEX_GPU_HNSW, so the SQ lookup missed and the load failed. Loading into the
+// SQ node (not the base GPU_HNSW node) is what exercises the fix.
+TEST_CASE("GPU HNSW_SQ node deserialize alias", "[gpu_hnsw_sq_alias]") {
+    const auto version = GenTestVersionList();
+    const auto metric = GENERATE(knowhere::metric::L2, knowhere::metric::COSINE);
+    CAPTURE(metric);
+
+    auto json = dtype_json(metric, "sq8");
+    auto train_ds = GenDataSet(kDtypeNb, kDtypeDim, kDtypeSeed);
+    auto query_ds = GenDataSet(kDtypeNq, kDtypeDim, kDtypeSeed + 2);
+
+    auto cpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW_SQ, version).value();
+    REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+    knowhere::BinarySet bs;
+    REQUIRE(cpu_idx.Serialize(bs) == knowhere::Status::success);
+
+    // Load into the GPU_HNSW_SQ node specifically (not the base GPU_HNSW node).
+    auto gpu_idx = knowhere::IndexFactory::Instance()
+                       .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW_SQ, version)
+                       .value();
+    REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+    auto results = gpu_idx.Search(query_ds, json, nullptr);
+    REQUIRE(results.has_value());
+    auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, json, nullptr);
+    REQUIRE(gt.has_value());
+    REQUIRE(GetKNNRecall(*gt.value(), *results.value()) >= 0.65f);
+}
+
+// v84: IP/COSINE distances must be returned as the true similarity (larger ==
+// closer), matching faiss's METRIC_INNER_PRODUCT contract. The GPU kernel keeps
+// a negated, min-first score internally and negates it back on copy-out;
+// Knowhere no longer re-negates. This checks the numeric distance value (sign +
+// magnitude) against the similarity recomputed from the returned neighbor, which
+// recall-only checks cannot catch. A re-introduced double negation would flip
+// every score negative and fail here.
+TEST_CASE("GPU HNSW IP/COSINE distance sign", "[gpu_hnsw_ip_sign]") {
+    const auto version = GenTestVersionList();
+    const auto metric = GENERATE(knowhere::metric::IP, knowhere::metric::COSINE);
+    CAPTURE(metric);
+    const bool is_cosine = (metric == knowhere::metric::COSINE);
+
+    auto json = dtype_json(metric, "");
+    auto train_ds = GenDataSet(kDtypeNb, kDtypeDim, kDtypeSeed);
+    auto query_ds = GenDataSet(kDtypeNq, kDtypeDim, kDtypeSeed + 2);
+    const auto* train = reinterpret_cast<const float*>(train_ds->GetTensor());
+    const auto* query = reinterpret_cast<const float*>(query_ds->GetTensor());
+
+    auto cpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+    REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+    knowhere::BinarySet bs;
+    REQUIRE(cpu_idx.Serialize(bs) == knowhere::Status::success);
+
+    auto gpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version).value();
+    REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+    auto results = gpu_idx.Search(query_ds, json, nullptr);
+    REQUIRE(results.has_value());
+    const int64_t* ids = results.value()->GetIds();
+    const float* dist = results.value()->GetDistance();
+
+    int positive_top1 = 0;
+    for (int64_t q = 0; q < kDtypeNq; q++) {
+        // Distances must be sorted best-first, i.e. descending for a
+        // larger-is-closer similarity metric.
+        for (int64_t j = 1; j < kDtypeTopk; j++) {
+            REQUIRE(dist[q * kDtypeTopk + j] <= dist[q * kDtypeTopk + j - 1] + 1e-4f);
+        }
+        // Recompute the true similarity between the query and the returned
+        // top-1 neighbor and compare to the reported distance.
+        int64_t nn = ids[q * kDtypeTopk];
+        REQUIRE(nn >= 0);
+        REQUIRE(nn < kDtypeNb);
+        double dot = 0.0, qn = 0.0, dn = 0.0;
+        for (int64_t d = 0; d < kDtypeDim; d++) {
+            double qv = query[q * kDtypeDim + d];
+            double dv = train[nn * kDtypeDim + d];
+            dot += qv * dv;
+            qn += qv * qv;
+            dn += dv * dv;
+        }
+        double expected = is_cosine ? dot / (std::sqrt(qn) * std::sqrt(dn) + 1e-12) : dot;
+        double got = dist[q * kDtypeTopk];
+        REQUIRE(std::fabs(got - expected) <= 1e-2 * (std::fabs(expected) + 1.0));
+        if (got > 0.0) positive_top1++;
+    }
+    // For this data the nearest neighbor's similarity is positive for the vast
+    // majority of queries; a sign inversion would make all of them negative.
+    REQUIRE(positive_top1 > kDtypeNq * 0.8);
+}
+
+// v84: every requested result slot must be a real neighbor (no UINT64_MAX/-1 id
+// or FLT_MAX sentinel). ef is guaranteed >= k: Knowhere's config bumps an unset
+// ef to max(k, 16) and the GPU kernel additionally auto-clamps ef=max(ef,k) as
+// defense-in-depth. Sentinel leakage into the last (k-ef) slots was the k>ef
+// symptom. ef is intentionally left unset here so the requested topk drives it.
+TEST_CASE("GPU HNSW returns k valid results (ef>=k)", "[gpu_hnsw_k_valid]") {
+    const auto version = GenTestVersionList();
+    const int64_t topk = 100;
+    knowhere::Json json;
+    json[knowhere::meta::DIM] = kDtypeDim;
+    json[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    json[knowhere::meta::TOPK] = topk;
+    json[knowhere::indexparam::HNSW_M] = 16;
+    json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+    // EF intentionally unset: Knowhere sets ef = max(topk, 16) = topk here.
+
+    auto train_ds = GenDataSet(kDtypeNb, kDtypeDim, kDtypeSeed);
+    auto query_ds = GenDataSet(kDtypeNq, kDtypeDim, kDtypeSeed + 2);
+
+    auto cpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+    REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+    knowhere::BinarySet bs;
+    REQUIRE(cpu_idx.Serialize(bs) == knowhere::Status::success);
+
+    auto gpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version).value();
+    REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+    auto results = gpu_idx.Search(query_ds, json, nullptr);
+    REQUIRE(results.has_value());
+    const int64_t* ids = results.value()->GetIds();
+    const float* dist = results.value()->GetDistance();
+    for (int64_t i = 0; i < kDtypeNq * topk; i++) {
+        REQUIRE(ids[i] >= 0);
+        REQUIRE(ids[i] < kDtypeNb);
+        REQUIRE(dist[i] < std::numeric_limits<float>::max());
+    }
 }
 #endif
