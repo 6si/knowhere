@@ -1039,8 +1039,11 @@ TEST_CASE("Test CPU vs GPU HNSW Comparison", "[gpu_hnsw_compare]") {
 
             fprintf(stderr, "  %6d  %10.4f  %10.4f  %10.2f  %10.2f\n", ef, cpu_recall, gpu_recall, cpu_ms, gpu_ms);
 
-            // GPU recall should be reasonable at all ef values
-            REQUIRE(gpu_recall >= 0.5f);
+            // This is a GPU-vs-CPU comparison: GPU HNSW must track the CPU HNSW oracle at
+            // every ef, not hit an arbitrary absolute floor. At small ef (e.g. ef=16, ~= k)
+            // HNSW recall is legitimately low on both engines (CPU itself is < 0.5 here), so
+            // an absolute floor is meaningless; parity with CPU is the correct invariant.
+            REQUIRE(gpu_recall >= cpu_recall - 0.05f);
         }
         fprintf(stderr, "===\n\n");
     }
