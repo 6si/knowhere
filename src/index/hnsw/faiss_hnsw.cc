@@ -3522,12 +3522,22 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     expected<DataSetPtr>
     Search(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
            milvus::OpContext* op_context) const override {
-        // GPU_HNSW does not apply the bitset, so reject any search that carries
-        // one. Guard on data()!=nullptr rather than count(), because count()
-        // defaults to 0 when the caller omits num_filtered_out_bits and would
-        // let a real filter slip through.
-        if (!bitset.empty() && bitset.data() != nullptr) {
-            return expected<DataSetPtr>::Err(Status::invalid_args, "GPU_HNSW does not support filtered search");
+        // Filtered search (deletes / TTL / partition / visibility bitset) is
+        // applied inside the GPU kernel: filtered rows stay graph waypoints but
+        // never enter the top-k, and a brute-force fallback guarantees k live
+        // results under heavy deletes (see faiss GpuHnswSearch.cuh /
+        // GpuHnswSearchKernel.cuh). The kernel tests the bitset by raw FAISS
+        // node id, which equals the segment row offset == BitsetView index
+        // (proven by the gpu_hnsw_id_mapping test). That direct mapping only
+        // holds when the view has no id remapping and no id offset, so those
+        // rarer shapes (never produced for a sealed GPU segment's delete
+        // bitset) are still rejected rather than silently mis-filtered.
+        const bool has_filter = !bitset.empty() && bitset.data() != nullptr;
+        if (has_filter && (bitset.has_out_ids() || bitset.id_offset() != 0)) {
+            return expected<DataSetPtr>::Err(
+                Status::invalid_args,
+                "GPU_HNSW filtered search does not support id-remapped or "
+                "id-offset bitsets");
         }
 
         // Take a shared-ownership snapshot of the GPU index under gpu_mutex_. The
@@ -3580,6 +3590,31 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         // normalization and silently return wrong scores for a cosine index.
         const bool is_cosine = gpu_snapshot->isCosine();
 
+        // The kernel indexes the bitset by node id in [0, ntotal); a bitset
+        // shorter than ntotal would read out of bounds. Milvus sizes the delete
+        // bitset to the segment row count (== ntotal), so this only guards
+        // against a malformed caller.
+        if (has_filter &&
+            static_cast<int64_t>(bitset.size()) < gpu_snapshot->ntotal) {
+            return expected<DataSetPtr>::Err(
+                Status::invalid_args,
+                "GPU_HNSW filtered search: bitset shorter than index size");
+        }
+
+        // Fill the filtered-search fields of a search-params struct from the
+        // incoming bitset. A null/empty bitset leaves them defaulted, taking
+        // the unfiltered fast path.
+        auto set_filter_params = [&](faiss::gpu::GpuHnswSearchParams& gsp) {
+            if (!has_filter) {
+                return;
+            }
+            gsp.bitset_data = bitset.data();
+            gsp.bitset_nbits = static_cast<int64_t>(bitset.size());
+            gsp.bitset_filtered_count = static_cast<int64_t>(bitset.count());
+            gsp.disable_fallback_brute_force =
+                    hnsw_cfg.disable_fallback_brute_force.value_or(false);
+        };
+
         auto h_ids = std::make_unique<int64_t[]>(nq * k);
         auto h_dist = std::make_unique<float[]>(nq * k);
 
@@ -3590,6 +3625,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
             try {
                 faiss::gpu::GpuHnswSearchParams gsp;
                 gsp.ef = ef;
+                set_filter_params(gsp);
                 gpu_snapshot->searchHostInt8(nq, h_queries_i8, k, h_dist.get(), h_ids.get(), gsp);
             } catch (const std::exception& e) {
                 LOG_KNOWHERE_ERROR_ << "GPU_HNSW int8 search failed: " << e.what();
@@ -3645,6 +3681,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         try {
             faiss::gpu::GpuHnswSearchParams gsp;
             gsp.ef = ef;
+            set_filter_params(gsp);
             gpu_snapshot->searchHost(nq, h_queries, k, h_dist.get(), h_ids.get(), gsp);
         } catch (const std::exception& e) {
             LOG_KNOWHERE_ERROR_ << "GPU_HNSW search failed: " << e.what();

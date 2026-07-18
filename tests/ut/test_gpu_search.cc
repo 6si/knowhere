@@ -1799,4 +1799,144 @@ TEST_CASE("GPU HNSW returns k valid results (ef>=k)", "[gpu_hnsw_k_valid]") {
         REQUIRE(dist[i] < std::numeric_limits<float>::max());
     }
 }
+
+// Blocking prerequisite for GPU filtered search: the kernel tests the delete
+// bitset by raw FAISS node id, so correctness hinges on
+//     GPU node id == storage row offset == BitsetView bit index.
+// This proves that mapping empirically with known ordered data and known
+// filters, independent of recall. If this ever fails, filtered search silently
+// excludes the wrong rows and every downstream filtered test is meaningless.
+TEST_CASE("GPU HNSW G-ID mapping: node id == row offset == bitset index", "[gpu_hnsw_id_mapping]") {
+    const auto version = GenTestVersionList();
+    const int64_t nb = 2000;
+    const int64_t dim = 32;
+
+    knowhere::Json json;
+    json[knowhere::meta::DIM] = dim;
+    json[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    json[knowhere::meta::TOPK] = 1;
+    json[knowhere::indexparam::HNSW_M] = 16;
+    json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+    json[knowhere::indexparam::EF] = 200;
+
+    // Ordered training data; each row is its own exact nearest neighbor (L2=0),
+    // so querying with row i must return id i.
+    auto train_ds = GenDataSet(nb, dim, 42);
+
+    auto cpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+    REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+    knowhere::BinarySet bs;
+    REQUIRE(cpu_idx.Serialize(bs) == knowhere::Status::success);
+
+    auto gpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version).value();
+    REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+    REQUIRE(gpu_idx.Count() == nb);
+
+    // 1) Unfiltered self-query: node id == storage row offset.
+    {
+        auto res = gpu_idx.Search(train_ds, json, nullptr);
+        REQUIRE(res.has_value());
+        const int64_t* ids = res.value()->GetIds();
+        for (int64_t i = 0; i < nb; i++) {
+            REQUIRE(ids[i] == i);
+        }
+    }
+
+    // 2) Filtered self-query: bit index == storage row offset. Filter every
+    //    third row; a returned id must never be a filtered bit, and a filtered
+    //    row's own id must be excluded from its self-query.
+    {
+        std::vector<uint8_t> bitset_data((nb + 7) / 8, 0);
+        int64_t filtered_count = 0;
+        for (int64_t r = 0; r < nb; r += 3) {
+            bitset_data[r / 8] |= static_cast<uint8_t>(1 << (r % 8));
+            filtered_count++;
+        }
+        knowhere::BitsetView bitset(bitset_data.data(), nb, filtered_count);
+
+        auto res = gpu_idx.Search(train_ds, json, bitset);
+        REQUIRE(res.has_value());
+        const int64_t* ids = res.value()->GetIds();
+        for (int64_t i = 0; i < nb; i++) {
+            const int64_t id = ids[i];
+            if (id == -1) {
+                continue;
+            }
+            const bool id_filtered = (bitset_data[id / 8] & (1 << (id % 8))) != 0;
+            REQUIRE_FALSE(id_filtered);
+            const bool query_filtered = (bitset_data[i / 8] & (1 << (i % 8))) != 0;
+            if (query_filtered) {
+                REQUIRE(id != i);
+            }
+        }
+    }
+}
+
+// Filtered-search recall/exclusion parity vs brute force across delete ratios.
+// Exercises the two-tier beam + alpha gate + brute-force fallback: no returned
+// id may be filtered, and recall of the live top-k must track brute force.
+TEST_CASE("GPU HNSW filtered search recall vs brute force", "[gpu_hnsw_filtered_recall]") {
+    const auto version = GenTestVersionList();
+    const int64_t nb = 8000;
+    const int64_t dim = 64;
+    const int64_t nq = 200;
+    const int64_t topk = 10;
+
+    knowhere::Json json;
+    json[knowhere::meta::DIM] = dim;
+    json[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    json[knowhere::meta::TOPK] = topk;
+    json[knowhere::indexparam::HNSW_M] = 16;
+    json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+    json[knowhere::indexparam::EF] = 200;
+
+    auto train_ds = GenDataSet(nb, dim, 42);
+    auto query_ds = GenDataSet(nq, dim, 44);
+
+    auto cpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+    REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+    knowhere::BinarySet bs;
+    REQUIRE(cpu_idx.Serialize(bs) == knowhere::Status::success);
+
+    auto gpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version).value();
+    REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+    std::mt19937 rng(123);
+    for (const float ratio : {0.1f, 0.5f, 0.9f, 0.95f, 0.99f}) {
+        std::vector<uint8_t> bitset_data((nb + 7) / 8, 0);
+        int64_t filtered_count = 0;
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        for (int64_t r = 0; r < nb; r++) {
+            if (u(rng) < ratio) {
+                bitset_data[r / 8] |= static_cast<uint8_t>(1 << (r % 8));
+                filtered_count++;
+            }
+        }
+        knowhere::BitsetView bitset(bitset_data.data(), nb, filtered_count);
+
+        auto res = gpu_idx.Search(query_ds, json, bitset);
+        REQUIRE(res.has_value());
+        const int64_t* ids = res.value()->GetIds();
+
+        // No returned id may be filtered out.
+        for (int64_t i = 0; i < nq * topk; i++) {
+            const int64_t id = ids[i];
+            if (id == -1) {
+                continue;
+            }
+            REQUIRE_FALSE((bitset_data[id / 8] & (1 << (id % 8))) != 0);
+        }
+
+        auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, json, bitset);
+        REQUIRE(gt.has_value());
+        float recall = GetKNNRecall(*gt.value(), *res.value());
+        // Parity is asserted by recall, not bit-identical traversal (the alpha
+        // gate is deterministic but not CPU encounter-order identical).
+        REQUIRE(recall >= 0.85f);
+    }
+}
 #endif
