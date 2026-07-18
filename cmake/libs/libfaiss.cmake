@@ -594,7 +594,22 @@ if(__PPC64)
   target_compile_definitions(faiss PRIVATE FINTEGER=int)
 endif()
 
-# GPU HNSW CUDA sources — compiled when WITH_CUVS is enabled
+# GPU HNSW CUDA sources — compiled when WITH_CUVS is enabled.
+#
+# This `faiss_gpu_hnsw` OBJECT library is the ONLY place the faiss GPU sources
+# are compiled in the knowhere build:
+#   * The main `faiss` STATIC target above is built from FAISS_SRCS, which globs
+#     only thirdparty/faiss/faiss/{*.cpp,impl,utils,...} — it deliberately does
+#     NOT include thirdparty/faiss/faiss/gpu/*, so none of the files below are
+#     also compiled into `faiss`.
+#   * Upstream faiss ships its own GPU build file
+#     (thirdparty/faiss/faiss/gpu/CMakeLists.txt → the `faiss_gpu_objs` target
+#     over FAISS_GPU_SRC). Knowhere assembles faiss manually via this .cmake and
+#     never `add_subdirectory()`s the vendored faiss tree, so that file (and
+#     `faiss_gpu_objs`) is never part of the knowhere build graph.
+# Therefore the two GPU build paths are mutually exclusive here — there is no
+# duplicate compilation or ODR hazard. Keep it that way: add GPU sources to the
+# list below, NOT by pulling in the vendored gpu/CMakeLists.txt.
 if(WITH_CUVS)
   set(FAISS_GPU_HNSW_SRCS
     thirdparty/faiss/faiss/gpu/GpuIndexHNSW.cu
