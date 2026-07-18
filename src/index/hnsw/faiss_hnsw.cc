@@ -3574,6 +3574,12 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         auto dim = dataset->GetDim();
         auto ef = hnsw_cfg.ef.value_or(200);
 
+        // Derive the metric from the built GPU index (captured at upload time
+        // from the FAISS index type), NOT from the search config. A config that
+        // omits metric_type defaults to L2, which would skip cosine query
+        // normalization and silently return wrong scores for a cosine index.
+        const bool is_cosine = gpu_snapshot->isCosine();
+
         auto h_ids = std::make_unique<int64_t[]>(nq * k);
         auto h_dist = std::make_unique<float[]>(nq * k);
 
@@ -3596,7 +3602,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
             // (the true cosine numerator scaled by the db inverse norm, already
             // sign-corrected to "larger == closer"); dividing by the query norm
             // finalizes the cosine similarity.
-            if (IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE)) {
+            if (is_cosine) {
                 for (int64_t i = 0; i < static_cast<int64_t>(nq); i++) {
                     const int8_t* q = h_queries_i8 + i * dim;
                     int32_t sq_norm = 0;
@@ -3623,7 +3629,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         // For COSINE metric, normalize queries to unit length.
         const float* h_queries = h_queries_raw;
         std::unique_ptr<float[]> normalized_queries;
-        if (IsMetricType(hnsw_cfg.metric_type.value(), metric::COSINE)) {
+        if (is_cosine) {
             normalized_queries = std::make_unique<float[]>(nq * dim);
             for (int64_t i = 0; i < nq; i++) {
                 const float* src = h_queries_raw + i * dim;

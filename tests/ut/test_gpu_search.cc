@@ -538,6 +538,58 @@ TEST_CASE("Test All GPU Index", "[search]") {
         REQUIRE(recall >= 0.80f);
     }
 
+    SECTION("Test GPU HNSW Cosine Metric Omitted From Search Config") {
+        // Regression for I1: the GPU node must derive the metric from the built
+        // GPU index (via GpuIndexHNSW::isCosine()), NOT from the search config.
+        // A search config that omits metric_type defaults to L2, which would
+        // skip cosine query normalization and silently return wrong scores.
+        // Here the index is COSINE but the search json carries no metric_type;
+        // results must match a search whose json explicitly sets COSINE.
+        knowhere::Json build_json;
+        build_json[knowhere::meta::DIM] = dim;
+        build_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::COSINE;
+        build_json[knowhere::meta::TOPK] = 10;
+        build_json[knowhere::indexparam::HNSW_M] = 16;
+        build_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+        build_json[knowhere::indexparam::EF] = 200;
+
+        auto train_ds = GenDataSet(nb, dim, seed);
+        auto query_ds = GenDataSet(nq, dim, seed + 1);
+
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        REQUIRE(cpu_idx.Build(train_ds, build_json) == knowhere::Status::success);
+
+        knowhere::BinarySet bs;
+        cpu_idx.Serialize(bs);
+
+        auto gpu_idx = knowhere::IndexFactory::Instance()
+                           .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                           .value();
+        REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+        // Baseline: search with metric_type explicitly set to COSINE.
+        auto with_metric = gpu_idx.Search(query_ds, build_json, nullptr);
+        REQUIRE(with_metric.has_value());
+
+        // Same search, but metric_type omitted from the config.
+        knowhere::Json no_metric_json = build_json;
+        no_metric_json.erase(knowhere::meta::METRIC_TYPE);
+        auto without_metric = gpu_idx.Search(query_ds, no_metric_json, nullptr);
+        REQUIRE(without_metric.has_value());
+
+        // The metric is index-derived, so both searches must be identical.
+        const int64_t topk = build_json[knowhere::meta::TOPK].get<int64_t>();
+        const auto* ids_a = with_metric.value()->GetIds();
+        const auto* ids_b = without_metric.value()->GetIds();
+        const auto* dist_a = with_metric.value()->GetDistance();
+        const auto* dist_b = without_metric.value()->GetDistance();
+        for (int64_t i = 0; i < nq * topk; ++i) {
+            REQUIRE(ids_a[i] == ids_b[i]);
+            REQUIRE(dist_a[i] == Approx(dist_b[i]).epsilon(1e-5));
+        }
+    }
+
     SECTION("Test GPU HNSW Search TopK") {
         knowhere::Json hnsw_json;
         hnsw_json[knowhere::meta::DIM] = dim;
