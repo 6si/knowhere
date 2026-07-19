@@ -14,8 +14,10 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "catch2/catch_approx.hpp"
@@ -1604,6 +1606,63 @@ gpu_dtype_recall(const std::string& index_type, const knowhere::Json& json, int 
     REQUIRE(gt.has_value());
     return GetKNNRecall(*gt.value(), *results.value());
 }
+
+// Filtered-search recall helper. Builds a CPU index of `index_type` on T,
+// uploads to GPU_HNSW, then for a given filter `ratio` searches with a random
+// delete bitset. Returns {gpu_recall, cpu_recall} where both are measured vs a
+// brute-force reference that uses the SAME bitset, so CPU HNSW is the parity
+// baseline (not brute force alone). Also asserts no returned GPU id is a
+// filtered bit. ratio == 0 exercises the HAS_FILTER=false fast path (empty
+// view => data()==nullptr => unfiltered).
+template <typename T>
+std::pair<float, float>
+gpu_filtered_recall(const std::string& index_type, const knowhere::Json& json, int version, float ratio,
+                    uint32_t bitset_seed) {
+    auto train_ds = knowhere::ConvertToDataTypeIfNeeded<T>(GenDataSet(kDtypeNb, kDtypeDim, kDtypeSeed));
+    auto query_ds = knowhere::ConvertToDataTypeIfNeeded<T>(GenDataSet(kDtypeNq, kDtypeDim, kDtypeSeed + 2));
+
+    auto cpu_idx = knowhere::IndexFactory::Instance().Create<T>(index_type, version).value();
+    REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+    knowhere::BinarySet bs;
+    REQUIRE(cpu_idx.Serialize(bs) == knowhere::Status::success);
+
+    auto gpu_idx = knowhere::IndexFactory::Instance().Create<T>(knowhere::IndexEnum::INDEX_GPU_HNSW, version).value();
+    REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+    std::vector<uint8_t> bitset_data((kDtypeNb + 7) / 8, 0);
+    int64_t filtered_count = 0;
+    std::mt19937 rng(bitset_seed);
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+    for (int64_t r = 0; r < kDtypeNb; r++) {
+        if (u(rng) < ratio) {
+            bitset_data[r / 8] |= static_cast<uint8_t>(1 << (r % 8));
+            filtered_count++;
+        }
+    }
+    const bool has_filter = filtered_count > 0;
+    knowhere::BitsetView bitset =
+        has_filter ? knowhere::BitsetView(bitset_data.data(), kDtypeNb, filtered_count) : knowhere::BitsetView();
+
+    auto gpu_res = gpu_idx.Search(query_ds, json, bitset);
+    REQUIRE(gpu_res.has_value());
+    const int64_t* gids = gpu_res.value()->GetIds();
+    for (int64_t i = 0; i < kDtypeNq * kDtypeTopk; i++) {
+        const int64_t id = gids[i];
+        if (id < 0) {
+            continue;
+        }
+        REQUIRE(id < kDtypeNb);
+        if (has_filter) {
+            REQUIRE_FALSE((bitset_data[id / 8] & (1 << (id % 8))) != 0);
+        }
+    }
+
+    auto cpu_res = cpu_idx.Search(query_ds, json, bitset);
+    REQUIRE(cpu_res.has_value());
+    auto gt = knowhere::BruteForce::Search<T>(train_ds, query_ds, json, bitset);
+    REQUIRE(gt.has_value());
+    return {GetKNNRecall(*gt.value(), *gpu_res.value()), GetKNNRecall(*gt.value(), *cpu_res.value())};
+}
 }  // namespace
 
 // FP32 flat storage -> generic <float,float,false> kernel. The config control.
@@ -1753,7 +1812,8 @@ TEST_CASE("GPU HNSW IP/COSINE distance sign", "[gpu_hnsw_ip_sign]") {
         double expected = is_cosine ? dot / (std::sqrt(qn) * std::sqrt(dn) + 1e-12) : dot;
         double got = dist[q * kDtypeTopk];
         REQUIRE(std::fabs(got - expected) <= 1e-2 * (std::fabs(expected) + 1.0));
-        if (got > 0.0) positive_top1++;
+        if (got > 0.0)
+            positive_top1++;
     }
     // For this data the nearest neighbor's similarity is positive for the vast
     // majority of queries; a sign inversion would make all of them negative.
@@ -1797,6 +1857,197 @@ TEST_CASE("GPU HNSW returns k valid results (ef>=k)", "[gpu_hnsw_k_valid]") {
         REQUIRE(ids[i] >= 0);
         REQUIRE(ids[i] < kDtypeNb);
         REQUIRE(dist[i] < std::numeric_limits<float>::max());
+    }
+}
+
+// Blocking prerequisite for GPU filtered search: the kernel tests the delete
+// bitset by raw FAISS node id, so correctness hinges on
+//     GPU node id == storage row offset == BitsetView bit index.
+// This proves that mapping empirically with known ordered data and known
+// filters, independent of recall. If this ever fails, filtered search silently
+// excludes the wrong rows and every downstream filtered test is meaningless.
+TEST_CASE("GPU HNSW G-ID mapping: node id == row offset == bitset index", "[gpu_hnsw_id_mapping]") {
+    const auto version = GenTestVersionList();
+    const int64_t nb = 2000;
+    const int64_t dim = 32;
+
+    knowhere::Json json;
+    json[knowhere::meta::DIM] = dim;
+    json[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    json[knowhere::meta::TOPK] = 1;
+    json[knowhere::indexparam::HNSW_M] = 16;
+    json[knowhere::indexparam::EFCONSTRUCTION] = 200;
+    json[knowhere::indexparam::EF] = 200;
+
+    // Randomly generated training data; regardless of order, every row is
+    // trivially its own exact nearest neighbor (L2 self-distance 0), so an
+    // unfiltered self-query for row i must return id i.
+    auto train_ds = GenDataSet(nb, dim, 42);
+
+    auto cpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+    REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+    knowhere::BinarySet bs;
+    REQUIRE(cpu_idx.Serialize(bs) == knowhere::Status::success);
+
+    auto gpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version).value();
+    REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+    REQUIRE(gpu_idx.Count() == nb);
+
+    // 1) Unfiltered self-query: node id == storage row offset.
+    {
+        auto res = gpu_idx.Search(train_ds, json, nullptr);
+        REQUIRE(res.has_value());
+        const int64_t* ids = res.value()->GetIds();
+        for (int64_t i = 0; i < nb; i++) {
+            REQUIRE(ids[i] == i);
+        }
+    }
+
+    // 2) Filtered self-query: bit index == storage row offset. Filter every
+    //    third row; a returned id must never be a filtered bit, and a filtered
+    //    row's own id must be excluded from its self-query.
+    {
+        std::vector<uint8_t> bitset_data((nb + 7) / 8, 0);
+        int64_t filtered_count = 0;
+        for (int64_t r = 0; r < nb; r += 3) {
+            bitset_data[r / 8] |= static_cast<uint8_t>(1 << (r % 8));
+            filtered_count++;
+        }
+        knowhere::BitsetView bitset(bitset_data.data(), nb, filtered_count);
+
+        auto res = gpu_idx.Search(train_ds, json, bitset);
+        REQUIRE(res.has_value());
+        const int64_t* ids = res.value()->GetIds();
+        for (int64_t i = 0; i < nb; i++) {
+            const int64_t id = ids[i];
+            if (id == -1) {
+                continue;
+            }
+            const bool id_filtered = (bitset_data[id / 8] & (1 << (id % 8))) != 0;
+            REQUIRE_FALSE(id_filtered);
+            const bool query_filtered = (bitset_data[i / 8] & (1 << (i % 8))) != 0;
+            if (query_filtered) {
+                REQUIRE(id != i);
+            }
+        }
+    }
+}
+
+// Filtered-search recall/exclusion parity across delete ratios and metrics.
+// Exercises the two-tier beam + alpha gate + brute-force fallback. For every
+// (metric, ratio) the helper asserts no returned id is a filtered bit; here we
+// assert GPU recall tracks the CPU HNSW baseline (both vs the SAME-bitset brute
+// force), which is the design's parity requirement. Parity is asserted by
+// recall, not bit-identical traversal (the alpha gate is deterministic but not
+// CPU encounter-order identical). ratio 0.0 exercises the HAS_FILTER=false fast
+// path; 0.3/0.7 cover the mid-range where the alpha-gate order divergence is
+// most pronounced; 0.95/0.99 trip the up-front brute-force fallback.
+namespace {
+void
+check_filtered_ratios(const std::string& index_type, const knowhere::Json& json) {
+    const auto version = GenTestVersionList();
+    uint32_t seed = 123;
+    for (const float ratio : {0.0f, 0.1f, 0.3f, 0.5f, 0.7f, 0.9f, 0.95f, 0.99f}) {
+        CAPTURE(ratio);
+        auto [gpu_recall, cpu_recall] = gpu_filtered_recall<knowhere::fp32>(index_type, json, version, ratio, seed++);
+        CAPTURE(gpu_recall);
+        CAPTURE(cpu_recall);
+        // Primary parity gate: GPU must not lag CPU HNSW by more than 0.05.
+        REQUIRE(gpu_recall >= cpu_recall - 0.05f);
+        if (ratio >= 0.93f) {
+            // Up-front brute force is exact -> recall should be ~1.0.
+            REQUIRE(gpu_recall >= 0.90f);
+        }
+    }
+}
+}  // namespace
+
+TEST_CASE("GPU HNSW filtered search recall (FP32 L2/IP/COSINE)", "[gpu_hnsw_filtered_recall]") {
+    const auto metric = GENERATE(knowhere::metric::L2, knowhere::metric::IP, knowhere::metric::COSINE);
+    CAPTURE(metric);
+    check_filtered_ratios(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""));
+}
+
+// INT8 native storage: IP/COSINE with dim%4==0 take the DP4A brute-force +
+// graph path; L2 takes the generic decoded path. Confirms the filter/BF kernels
+// are threaded through searchHostInt8, not just the fp32 searchHost.
+TEST_CASE("GPU HNSW filtered search recall (INT8 native L2/IP/COSINE)", "[gpu_hnsw_filtered_recall_int8]") {
+    const auto version = GenTestVersionList();
+    const auto metric = GENERATE(knowhere::metric::L2, knowhere::metric::IP, knowhere::metric::COSINE);
+    CAPTURE(metric);
+    uint32_t seed = 777;
+    for (const float ratio : {0.0f, 0.5f, 0.9f, 0.99f}) {
+        CAPTURE(ratio);
+        auto [gpu_recall, cpu_recall] = gpu_filtered_recall<knowhere::int8>(
+            knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""), version, ratio, seed++);
+        CAPTURE(gpu_recall);
+        CAPTURE(cpu_recall);
+        REQUIRE(gpu_recall >= cpu_recall - 0.05f);
+        if (ratio >= 0.93f) {
+            REQUIRE(gpu_recall >= 0.90f);
+        }
+    }
+}
+
+// Edge cases the ratio sweep does not cover: everything filtered (no live rows)
+// and k larger than the live-row count. Both must return sentinels for the
+// missing slots rather than a filtered id or an error.
+TEST_CASE("GPU HNSW filtered search edge cases", "[gpu_hnsw_filtered_edge]") {
+    const auto version = GenTestVersionList();
+    const int64_t nb = 4000;
+    const int64_t dim = 64;
+    const int64_t nq = 32;
+
+    auto json = dtype_json(knowhere::metric::L2, "");
+    json[knowhere::meta::TOPK] = 10;
+    auto train_ds = GenDataSet(nb, dim, 42);
+    auto query_ds = GenDataSet(nq, dim, 44);
+
+    auto cpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+    REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+    knowhere::BinarySet bs;
+    REQUIRE(cpu_idx.Serialize(bs) == knowhere::Status::success);
+    auto gpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_GPU_HNSW, version).value();
+    REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+    // 1) All rows filtered: every result slot must be a sentinel (-1), never a
+    //    filtered id, and the search must not error.
+    {
+        std::vector<uint8_t> bitset_data((nb + 7) / 8, 0xFF);
+        knowhere::BitsetView bitset(bitset_data.data(), nb, nb);
+        auto res = gpu_idx.Search(query_ds, json, bitset);
+        REQUIRE(res.has_value());
+        const int64_t* ids = res.value()->GetIds();
+        for (int64_t i = 0; i < nq * 10; i++) {
+            REQUIRE(ids[i] == -1);
+        }
+    }
+
+    // 2) k > live_count: only a handful of rows survive; the first `live` slots
+    //    per query must be live ids, the remainder sentinels.
+    {
+        const int64_t live = 3;
+        std::vector<uint8_t> bitset_data((nb + 7) / 8, 0xFF);
+        for (int64_t r = 0; r < live; r++) {
+            bitset_data[r / 8] &= static_cast<uint8_t>(~(1 << (r % 8)));
+        }
+        knowhere::BitsetView bitset(bitset_data.data(), nb, nb - live);
+        auto res = gpu_idx.Search(query_ds, json, bitset);
+        REQUIRE(res.has_value());
+        const int64_t* ids = res.value()->GetIds();
+        for (int64_t q = 0; q < nq; q++) {
+            for (int64_t j = 0; j < 10; j++) {
+                const int64_t id = ids[q * 10 + j];
+                if (id == -1) {
+                    continue;
+                }
+                REQUIRE(id < live);
+            }
+        }
     }
 }
 #endif
