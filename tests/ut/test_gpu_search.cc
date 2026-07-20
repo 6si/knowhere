@@ -2050,4 +2050,103 @@ TEST_CASE("GPU HNSW filtered search edge cases", "[gpu_hnsw_filtered_edge]") {
         }
     }
 }
+
+// Visited-bitmap OOM fix: the layer-0 search processes queries in nq-chunks so
+// the grow-only visited bitmap (nq * ceil(N/32) * 4 bytes per scratch slot) is
+// bounded regardless of batch size / search concurrency. Chunking must be
+// result-invariant: each query is independent, and every per-query buffer
+// (queries, entry points, neighbors, distances, visited bitmap, BF worklist) is
+// indexed by the chunk-local block index against a caller-offset base pointer.
+// This runs the SAME search twice -- once with the default cap (single pass) and
+// once with GPU_HNSW_BITMAP_BYTES forced small enough to split the batch into
+// many chunks -- and asserts the ids and distances match element-for-element.
+namespace {
+template <typename T>
+void
+check_chunk_parity(const std::string& index_type, const knowhere::Json& json, const knowhere::BitsetView& bitset) {
+    using Catch::Approx;
+    const auto version = GenTestVersionList();
+    auto train_ds = knowhere::ConvertToDataTypeIfNeeded<T>(GenDataSet(kDtypeNb, kDtypeDim, kDtypeSeed));
+    auto query_ds = knowhere::ConvertToDataTypeIfNeeded<T>(GenDataSet(kDtypeNq, kDtypeDim, kDtypeSeed + 2));
+
+    auto cpu_idx = knowhere::IndexFactory::Instance().Create<T>(index_type, version).value();
+    REQUIRE(cpu_idx.Build(train_ds, json) == knowhere::Status::success);
+    knowhere::BinarySet bs;
+    REQUIRE(cpu_idx.Serialize(bs) == knowhere::Status::success);
+    auto gpu_idx = knowhere::IndexFactory::Instance().Create<T>(knowhere::IndexEnum::INDEX_GPU_HNSW, version).value();
+    REQUIRE(gpu_idx.Deserialize(bs) == knowhere::Status::success);
+
+    // Baseline: default cap => chunk == nq (single pass).
+    ::unsetenv("GPU_HNSW_BITMAP_BYTES");
+    ::unsetenv("GPU_HNSW_BITMAP_MB");
+    auto base = gpu_idx.Search(query_ds, json, bitset);
+    REQUIRE(base.has_value());
+    const int64_t n_out = static_cast<int64_t>(kDtypeNq) * kDtypeTopk;
+    std::vector<int64_t> base_ids(base.value()->GetIds(), base.value()->GetIds() + n_out);
+    std::vector<float> base_dist(base.value()->GetDistance(), base.value()->GetDistance() + n_out);
+
+    // Force chunking: cap the bitmap to ~2 queries' worth so the batch is split
+    // into ~nq/2 chunks, exercising the multi-launch offset math and the
+    // per-chunk bitmap/worklist resets.
+    const long per_query = static_cast<long>((kDtypeNb + 31) / 32) * 4;
+    ::setenv("GPU_HNSW_BITMAP_BYTES", std::to_string(2 * per_query).c_str(), 1);
+    auto chunked = gpu_idx.Search(query_ds, json, bitset);
+    ::unsetenv("GPU_HNSW_BITMAP_BYTES");
+    REQUIRE(chunked.has_value());
+    const int64_t* cids = chunked.value()->GetIds();
+    const float* cdist = chunked.value()->GetDistance();
+
+    for (int64_t i = 0; i < n_out; i++) {
+        REQUIRE(cids[i] == base_ids[i]);
+        REQUIRE(cdist[i] == Approx(base_dist[i]).epsilon(1e-5));
+    }
+}
+
+std::vector<uint8_t>
+make_random_bitset(float ratio, uint32_t seed, int64_t& filtered_count) {
+    std::vector<uint8_t> bd((kDtypeNb + 7) / 8, 0);
+    filtered_count = 0;
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+    for (int64_t r = 0; r < kDtypeNb; r++) {
+        if (u(rng) < ratio) {
+            bd[r / 8] |= static_cast<uint8_t>(1 << (r % 8));
+            filtered_count++;
+        }
+    }
+    return bd;
+}
+}  // namespace
+
+TEST_CASE("GPU HNSW nq-chunking is result-invariant (visited-bitmap OOM fix)", "[gpu_hnsw_chunk_parity]") {
+    const auto metric = GENERATE(knowhere::metric::L2, knowhere::metric::IP, knowhere::metric::COSINE);
+    CAPTURE(metric);
+
+    // Unfiltered (HAS_FILTER=false fast path).
+    SECTION("fp32 unfiltered") {
+        check_chunk_parity<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""),
+                                           knowhere::BitsetView());
+    }
+    // int8: IP/COSINE with dim%4==0 take the DP4A path, where the layer-0 (int8)
+    // and upper-layer (fp32) query buffers are distinct, so BOTH chunk offsets
+    // must be correct; L2 takes the generic decoded path.
+    SECTION("int8 unfiltered") {
+        check_chunk_parity<knowhere::int8>(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""),
+                                           knowhere::BitsetView());
+    }
+    // Mid-ratio filter: HAS_FILTER=true two-tier beam + per-chunk worklist reset.
+    SECTION("fp32 filtered (~30%)") {
+        int64_t fc = 0;
+        auto bd = make_random_bitset(0.3f, 7, fc);
+        knowhere::BitsetView bitset(bd.data(), kDtypeNb, fc);
+        check_chunk_parity<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""), bitset);
+    }
+    // High-ratio filter: trips the up-front brute-force fallback (also chunked).
+    SECTION("fp32 filtered (~99% -> up-front BF)") {
+        int64_t fc = 0;
+        auto bd = make_random_bitset(0.99f, 9, fc);
+        knowhere::BitsetView bitset(bd.data(), kDtypeNb, fc);
+        check_chunk_parity<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""), bitset);
+    }
+}
 #endif
