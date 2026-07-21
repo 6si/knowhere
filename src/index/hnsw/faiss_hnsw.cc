@@ -3291,6 +3291,9 @@ KNOWHERE_SIMPLE_REGISTER_DENSE_INT_GLOBAL(HNSW_PRQ, BaseFaissRegularIndexHNSWPRQ
 #ifdef KNOWHERE_WITH_CUVS
 }  // namespace knowhere — temporarily close to include GPU headers at file scope
 // ── GPU HNSW ─────────────────────────────────────────────────────────────────
+#include <faiss/IndexFlat.h>
+#include <faiss/IndexHNSW.h>
+#include <faiss/IndexScalarQuantizer.h>
 #include <faiss/gpu/GpuIndexHNSW.h>
 #include <faiss/gpu/StandardGpuResources.h>
 namespace knowhere {  // reopen namespace knowhere
@@ -3326,6 +3329,98 @@ static std::mutex&
 GetGpuConstructionMutex() {
     static std::mutex mtx;
     return mtx;
+}
+
+// L2-normalize each row of an n x d row-major matrix in place. Zero-norm rows
+// are left unchanged (their inverse norm is treated as 1), matching the cosine
+// convention used elsewhere in this file.
+static void
+NormalizeRowsInPlace(float* x, int64_t n, int64_t d) {
+    for (int64_t i = 0; i < n; i++) {
+        float* row = x + i * d;
+        float sq = 0.0f;
+        for (int64_t j = 0; j < d; j++) {
+            sq += row[j] * row[j];
+        }
+        if (sq > 0.0f) {
+            const float inv = 1.0f / std::sqrt(sq);
+            for (int64_t j = 0; j < d; j++) {
+                row[j] *= inv;
+            }
+        }
+    }
+}
+
+// Convert a deserialized cppcontrib::knowhere::IndexHNSW into a vanilla
+// faiss::IndexHNSW suitable for faiss::gpu::GpuIndexHNSW::copyFrom().
+//
+// The HNSW graph layout is identical between the two (same faiss::HNSW CSR
+// fields backed by the same faiss::MaybeOwnedVector<int32_t>), so the graph is
+// copied field-by-field. Storage handling:
+//   * L2 / IP (non-cosine): the source storage already derives from vanilla
+//     faiss::IndexFlat / faiss::IndexScalarQuantizer, so it is borrowed
+//     directly (own_fields=false) — no re-encode, byte-identical codes. Safe
+//     because the returned index is only used for the synchronous copyFrom()
+//     upload and is destroyed before the source CPU index is freed.
+//   * COSINE: faiss has no cosine metric / inverse-norm buffer on GPU, so the
+//     vectors are reconstructed, L2-normalized, and re-encoded into a fresh
+//     vanilla storage with METRIC_INNER_PRODUCT (normalize+IP convention). For
+//     scalar-quantized storage this re-quantizes the normalized vectors, which
+//     is not byte-identical to the legacy inverse-norm path (recall is gated in
+//     tests; a collection may need re-ingest for quantized cosine).
+static std::unique_ptr<faiss::IndexHNSW>
+ToVanillaHnsw(const faiss::cppcontrib::knowhere::IndexHNSW* src, bool is_cosine) {
+    const int64_t d = src->d;
+    const int64_t n = src->ntotal;
+    const faiss::MetricType out_metric =
+        (is_cosine || src->metric_type == faiss::METRIC_INNER_PRODUCT) ? faiss::METRIC_INNER_PRODUCT : faiss::METRIC_L2;
+
+    auto dst = std::make_unique<faiss::IndexHNSW>();
+    dst->d = static_cast<int>(d);
+    dst->ntotal = n;
+    dst->metric_type = out_metric;
+    dst->is_trained = true;
+
+    if (is_cosine) {
+        // Reconstruct -> normalize -> re-encode into fresh vanilla storage.
+        std::vector<float> recons(static_cast<size_t>(n) * d);
+        if (n > 0) {
+            src->storage->reconstruct_n(0, n, recons.data());
+            NormalizeRowsInPlace(recons.data(), n, d);
+        }
+        const auto* src_sq = dynamic_cast<const faiss::IndexScalarQuantizer*>(src->storage);
+        if (src_sq != nullptr) {
+            auto* out_sq = new faiss::IndexScalarQuantizer(static_cast<int>(d), src_sq->sq.qtype, out_metric);
+            if (n > 0) {
+                out_sq->train(n, recons.data());
+                out_sq->add(n, recons.data());
+            }
+            dst->storage = out_sq;
+        } else {
+            auto* out_flat = new faiss::IndexFlat(static_cast<int>(d), out_metric);
+            if (n > 0) {
+                out_flat->add(n, recons.data());
+            }
+            dst->storage = out_flat;
+        }
+        dst->own_fields = true;
+    } else {
+        // Borrow the source storage (already a vanilla Flat/SQ subclass). The
+        // returned index must not outlive src; it is consumed by copyFrom().
+        dst->storage = src->storage;
+        dst->own_fields = false;
+    }
+
+    // Copy the graph (identical CSR layout).
+    dst->hnsw.assign_probas = src->hnsw.assign_probas;
+    dst->hnsw.cum_nneighbor_per_level = src->hnsw.cum_nneighbor_per_level;
+    dst->hnsw.levels = src->hnsw.levels;
+    dst->hnsw.offsets = src->hnsw.offsets;
+    dst->hnsw.neighbors = src->hnsw.neighbors;
+    dst->hnsw.entry_point = src->hnsw.entry_point;
+    dst->hnsw.max_level = src->hnsw.max_level;
+
+    return dst;
 }
 
 // GPU HNSW index node. Registered for F32, FP16, BF16 and INT8 (see
@@ -3482,8 +3577,8 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         const std::string self_key = Type();
         if (!binset.Contains(self_key)) {
             BinarySet aliased = binset;
-            for (const char* key : {IndexEnum::INDEX_GPU_HNSW, IndexEnum::INDEX_GPU_HNSW_SQ,
-                                    IndexEnum::INDEX_HNSW_SQ, IndexEnum::INDEX_HNSW}) {
+            for (const char* key : {IndexEnum::INDEX_GPU_HNSW, IndexEnum::INDEX_GPU_HNSW_SQ, IndexEnum::INDEX_HNSW_SQ,
+                                    IndexEnum::INDEX_HNSW}) {
                 if (binset.Contains(key)) {
                     aliased.Append(self_key, binset.GetByName(key));
                     break;
@@ -3534,10 +3629,9 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         // bitset) are still rejected rather than silently mis-filtered.
         const bool has_filter = !bitset.empty() && bitset.data() != nullptr;
         if (has_filter && (bitset.has_out_ids() || bitset.id_offset() != 0)) {
-            return expected<DataSetPtr>::Err(
-                Status::invalid_args,
-                "GPU_HNSW filtered search does not support id-remapped or "
-                "id-offset bitsets");
+            return expected<DataSetPtr>::Err(Status::invalid_args,
+                                             "GPU_HNSW filtered search does not support id-remapped or "
+                                             "id-offset bitsets");
         }
 
         // Take a shared-ownership snapshot of the GPU index under gpu_mutex_. The
@@ -3568,8 +3662,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                 // index with the wrong metric.
                 Status upload_status = UploadCpuIndexToGpuLocked();
                 if (upload_status != Status::success) {
-                    return expected<DataSetPtr>::Err(Status::cuvs_inner_error,
-                                                     "failed to build GPU HNSW index");
+                    return expected<DataSetPtr>::Err(Status::cuvs_inner_error, "failed to build GPU HNSW index");
                 }
                 gpu_snapshot = gpu_index_;
                 if (!gpu_snapshot) {
@@ -3588,17 +3681,15 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         // from the FAISS index type), NOT from the search config. A config that
         // omits metric_type defaults to L2, which would skip cosine query
         // normalization and silently return wrong scores for a cosine index.
-        const bool is_cosine = gpu_snapshot->isCosine();
+        const bool is_cosine = gpu_is_cosine_;
 
         // The kernel indexes the bitset by node id in [0, ntotal); a bitset
         // shorter than ntotal would read out of bounds. Milvus sizes the delete
         // bitset to the segment row count (== ntotal), so this only guards
         // against a malformed caller.
-        if (has_filter &&
-            static_cast<int64_t>(bitset.size()) < gpu_snapshot->ntotal) {
-            return expected<DataSetPtr>::Err(
-                Status::invalid_args,
-                "GPU_HNSW filtered search: bitset shorter than index size");
+        if (has_filter && static_cast<int64_t>(bitset.size()) < gpu_snapshot->ntotal) {
+            return expected<DataSetPtr>::Err(Status::invalid_args,
+                                             "GPU_HNSW filtered search: bitset shorter than index size");
         }
 
         // Fill the filtered-search fields of a search-params struct from the
@@ -3611,8 +3702,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
             gsp.bitset_data = bitset.data();
             gsp.bitset_nbits = static_cast<int64_t>(bitset.size());
             gsp.bitset_filtered_count = static_cast<int64_t>(bitset.count());
-            gsp.disable_fallback_brute_force =
-                    hnsw_cfg.disable_fallback_brute_force.value_or(false);
+            gsp.disable_fallback_brute_force = hnsw_cfg.disable_fallback_brute_force.value_or(false);
         };
 
         auto h_ids = std::make_unique<int64_t[]>(nq * k);
@@ -3620,8 +3710,7 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
 
         // Native int8 DP4A path: queries arrive as raw int8 (no MockWrapper upcast).
         if (data_format == DataFormatEnum::int8) {
-            const auto* h_queries_i8 =
-                    reinterpret_cast<const int8_t*>(dataset->GetTensor());
+            const auto* h_queries_i8 = reinterpret_cast<const int8_t*>(dataset->GetTensor());
             try {
                 faiss::gpu::GpuHnswSearchParams gsp;
                 gsp.ef = ef;
@@ -3633,11 +3722,12 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                                                  std::string("GPU HNSW int8 search failed: ") + e.what());
             }
 
-            // For COSINE, post-scale distances by 1/||q|| so scores are in
-            // [-1, 1]. The kernel returns dot(shifted_q, shifted_db) * (1/||db||)
-            // (the true cosine numerator scaled by the db inverse norm, already
-            // sign-corrected to "larger == closer"); dividing by the query norm
-            // finalizes the cosine similarity.
+            // For COSINE, post-scale distances by 1/||q||. In the vanilla path
+            // the database vectors were L2-normalized before int8 re-encoding
+            // (no inverse-norm buffer is uploaded), so the kernel returns
+            // dot(q_i8, normalized_db_i8); dividing by the query norm finalizes
+            // the cosine similarity. Quantized-cosine numerics differ from the
+            // legacy inverse-norm path and are validated by the recall gate.
             if (is_cosine) {
                 for (int64_t i = 0; i < static_cast<int64_t>(nq); i++) {
                     const int8_t* q = h_queries_i8 + i * dim;
@@ -3725,20 +3815,28 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
             // an empty json defaults metric_type to L2).
             bool is_cosine =
                 dynamic_cast<const ::faiss::cppcontrib::knowhere::HasInverseL2Norms*>(faiss_idx) != nullptr;
-            bool use_ip = is_cosine || (faiss_idx->metric_type == ::faiss::METRIC_INNER_PRODUCT);
+
+            // Convert the deserialized cppcontrib index to a vanilla
+            // faiss::IndexHNSW and upload via the vanilla copyFrom(). Cosine is
+            // folded into normalize+IP inside ToVanillaHnsw (out metric == IP),
+            // so the GPU index needs no cosine/inverse-norm handling.
+            std::unique_ptr<faiss::IndexHNSW> vanilla = ToVanillaHnsw(faiss_idx, is_cosine);
 
             std::shared_ptr<faiss::gpu::GpuIndexHNSW> local;
             {
                 std::lock_guard<std::mutex> gpu_ctor_lock(GetGpuConstructionMutex());
                 gpu_resources_ = GetSharedGpuResources();
-                local = std::make_shared<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), faiss_idx->d,
-                                                                   faiss_idx->metric_type);
+                local =
+                    std::make_shared<faiss::gpu::GpuIndexHNSW>(gpu_resources_.get(), vanilla->d, vanilla->metric_type);
             }
-            local->copyFromWithMetric(faiss_idx, use_ip, is_cosine);
+            local->copyFrom(vanilla.get());
             // Capture count/dim before releasing the CPU copy so Count()/Dim()
             // keep working once indexes[0] is freed.
             gpu_ntotal_ = faiss_idx->ntotal;
             gpu_dim_ = faiss_idx->d;
+            // Remember cosine-ness for the query-side normalization in Search()
+            // (the GPU index only knows IP, not cosine).
+            gpu_is_cosine_ = is_cosine;
             // Release CPU copy — vectors and graph are now on GPU. This is what
             // drops the transient host-RAM peak back to ~0. const_cast because
             // this helper is const (reused from the const Search() lazy path);
@@ -3783,6 +3881,11 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
     // const lazy-upload path in Search(), hence mutable).
     mutable int64_t gpu_ntotal_ = 0;
     mutable int64_t gpu_dim_ = 0;
+    // Whether the loaded index used the COSINE metric. The GPU index only
+    // distinguishes L2 vs IP (cosine is folded into normalize+IP at upload),
+    // so Search() consults this to decide whether to normalize queries.
+    // Written under the construction path before gpu_ready_ is published.
+    mutable bool gpu_is_cosine_ = false;
 };
 
 // GPU_HNSW_SQ is an alias of GPU_HNSW: the GPU search path is identical (a
