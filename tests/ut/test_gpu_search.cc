@@ -841,7 +841,8 @@ TEST_CASE("Test All GPU Index", "[search]") {
         // the next power of two (64) and grows the block accordingly. Before the
         // padding fix this configuration hard-failed every GPU search. Cover
         // both the generic fp32-query kernel and the native int8 DP4A kernel
-        // (dim=128 is divisible by 4, so int8 COSINE takes the DP4A path).
+        // (dim=128 is divisible by 4, so int8 L2/IP takes the DP4A path; int8
+        // COSINE is re-encoded as fp16 and uses the fp32-query kernel instead).
         const int64_t m = 24;
 
         SECTION("fp32 cosine, non-pow2 2*M") {
@@ -878,10 +879,10 @@ TEST_CASE("Test All GPU Index", "[search]") {
             REQUIRE(recall >= 0.80f);
         }
 
-        SECTION("int8 cosine DP4A, non-pow2 2*M") {
+        SECTION("int8 IP DP4A, non-pow2 2*M") {
             knowhere::Json hnsw_json;
             hnsw_json[knowhere::meta::DIM] = dim;
-            hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::COSINE;
+            hnsw_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::IP;
             hnsw_json[knowhere::meta::TOPK] = 10;
             hnsw_json[knowhere::indexparam::HNSW_M] = m;
             hnsw_json[knowhere::indexparam::EFCONSTRUCTION] = 200;
@@ -1279,44 +1280,35 @@ TEST_CASE("Test GPU HNSW Codex P1 Regressions", "[gpu_hnsw_p1]") {
         auto gpu_results = gpu_idx.Search(query_ds, json, nullptr);
         REQUIRE(gpu_results.has_value());
 
-        const auto* cpu_ids = cpu_results.value()->GetIds();
-        const auto* gpu_ids = gpu_results.value()->GetIds();
-        const auto* cpu_dist = cpu_results.value()->GetDistance();
-        const auto* gpu_dist = gpu_results.value()->GetDistance();
+        // Oracle: exact cosine top-k from a brute-force search over the ORIGINAL
+        // (un-quantized) vectors. This is the representation-agnostic ground
+        // truth for normalized cosine. The legacy CPU cppcontrib index encodes
+        // cosine as direct_signed codes + inverse-L2-norms of the ORIGINAL
+        // vectors; the native GPU path L2-normalizes and re-encodes (int8 ->
+        // fp16, fp16/bf16 kept), so byte/score parity between the two no longer
+        // holds and would be the wrong thing to assert. Both must instead track
+        // true cosine recall.
+        knowhere::Json bf_json;
+        bf_json[knowhere::meta::DIM] = dim;
+        bf_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::COSINE;
+        bf_json[knowhere::meta::TOPK] = topk;
+        auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, bf_json, nullptr);
+        REQUIRE(gt.has_value());
 
-        // Top-1 must match the CPU index for the overwhelming majority of
-        // queries: identical cosine semantics (same norms) means identical
-        // nearest neighbor modulo rare quantization ties.
-        int top1_match = 0;
-        for (int64_t q = 0; q < nq; ++q) {
-            if (cpu_ids[q * topk] == gpu_ids[q * topk]) {
-                top1_match++;
-            }
-        }
-        float top1_ratio = static_cast<float>(top1_match) / nq;
-        CAPTURE(top1_ratio);
-        REQUIRE(top1_ratio >= 0.95f);
+        float cpu_recall = GetKNNRecall(*gt.value(), *cpu_results.value());
+        float gpu_recall = GetKNNRecall(*gt.value(), *gpu_results.value());
+        CAPTURE(cpu_recall);
+        CAPTURE(gpu_recall);
 
-        // Per-result cosine scores must agree closely (both decode identical SQ
-        // codes and apply the SAME original inverse norms). A loose floor would
-        // hide the pre-fix norm mismatch, so keep the tolerance tight.
-        int compared = 0, close = 0;
-        for (int64_t q = 0; q < nq; ++q) {
-            // Only compare positions where CPU and GPU agree on the id, so score
-            // comparison is like-for-like.
-            for (int64_t j = 0; j < topk; ++j) {
-                if (cpu_ids[q * topk + j] == gpu_ids[q * topk + j]) {
-                    compared++;
-                    if (GetRelativeLoss(cpu_dist[q * topk + j], gpu_dist[q * topk + j]) < 0.02f) {
-                        close++;
-                    }
-                }
-            }
-        }
-        REQUIRE(compared > 0);
-        float close_ratio = static_cast<float>(close) / compared;
-        CAPTURE(close_ratio);
-        REQUIRE(close_ratio >= 0.98f);
+        // Recall bar against exact cosine. int8 is re-encoded as fp16 on the
+        // GPU (direct_signed collapses normalized data), so it clears the same
+        // high bar as fp16/bf16 rather than degrading.
+        const float min_recall = 0.85f;
+        REQUIRE(gpu_recall >= min_recall);
+
+        // The GPU must track the CPU oracle, not diverge: allow a small margin
+        // for the quantizer/normalization differences between the two paths.
+        REQUIRE(gpu_recall >= cpu_recall - 0.10f);
     }
 
     // #2: search must not use-after-free a GPU index that a concurrent reload
@@ -1559,7 +1551,9 @@ TEST_CASE("Test GPU HNSW Codex P1 Regressions", "[gpu_hnsw_p1]") {
 // fp32 (the <float,float,false> kernel) is clean here while fp16
 // (<__half,float,false>) faults, the defect is specific to the low-precision
 // storage kernel; if fp32 also faults, it is config- rather than dtype-driven.
-// dim=64 is divisible by 4, so the int8 IP/COSINE cases take the DP4A path.
+// dim=64 is divisible by 4, so the int8 IP case takes the DP4A path; int8
+// COSINE is re-encoded as fp16 (see ToVanillaHnsw) and uses the fp32-query
+// kernel instead.
 namespace {
 constexpr int64_t kDtypeNb = 4000;
 constexpr int64_t kDtypeNq = 200;
@@ -1709,9 +1703,11 @@ TEST_CASE("GPU HNSW dtype: SQ8 decoded (L2/IP/COSINE)", "[gpu_hnsw_dtype_sq8]") 
     REQUIRE(recall >= 0.65f);
 }
 
-// INT8 native 1-byte storage. IP/COSINE with dim%4==0 take the DP4A kernel
+// INT8 native 1-byte storage. IP with dim%4==0 takes the DP4A kernel
 // (<int8_t,int8_t,true>); L2 takes the generic decoded path (<int8_t,float,
-// false>).
+// false>). COSINE is re-encoded as fp16 in ToVanillaHnsw (direct_signed
+// collapses normalized data) and the int8 query is widened to fp32, so cosine
+// uses the fp16 generic path, not DP4A.
 TEST_CASE("GPU HNSW dtype: INT8 native (L2/IP/COSINE)", "[gpu_hnsw_dtype_int8]") {
     const auto version = GenTestVersionList();
     const auto metric = GENERATE(knowhere::metric::L2, knowhere::metric::IP, knowhere::metric::COSINE);
@@ -1970,9 +1966,10 @@ TEST_CASE("GPU HNSW filtered search recall (FP32 L2/IP/COSINE)", "[gpu_hnsw_filt
     check_filtered_ratios(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""));
 }
 
-// INT8 native storage: IP/COSINE with dim%4==0 take the DP4A brute-force +
-// graph path; L2 takes the generic decoded path. Confirms the filter/BF kernels
-// are threaded through searchHostInt8, not just the fp32 searchHost.
+// INT8 native storage: IP with dim%4==0 takes the DP4A brute-force + graph
+// path; L2 takes the generic decoded path. COSINE is re-encoded as fp16 and
+// uses the fp32-query path. Confirms the filter/BF kernels are threaded through
+// both searchHostInt8 (IP) and the fp32 searchHost (L2, cosine).
 TEST_CASE("GPU HNSW filtered search recall (INT8 native L2/IP/COSINE)", "[gpu_hnsw_filtered_recall_int8]") {
     const auto version = GenTestVersionList();
     const auto metric = GENERATE(knowhere::metric::L2, knowhere::metric::IP, knowhere::metric::COSINE);
@@ -2127,9 +2124,10 @@ TEST_CASE("GPU HNSW nq-chunking is result-invariant (visited-bitmap OOM fix)", "
         check_chunk_parity<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""),
                                            knowhere::BitsetView());
     }
-    // int8: IP/COSINE with dim%4==0 take the DP4A path, where the layer-0 (int8)
+    // int8: IP with dim%4==0 takes the DP4A path, where the layer-0 (int8)
     // and upper-layer (fp32) query buffers are distinct, so BOTH chunk offsets
-    // must be correct; L2 takes the generic decoded path.
+    // must be correct; L2 takes the generic decoded path and COSINE is
+    // re-encoded as fp16 (fp32-query path).
     SECTION("int8 unfiltered") {
         check_chunk_parity<knowhere::int8>(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""),
                                            knowhere::BitsetView());

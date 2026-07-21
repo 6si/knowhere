@@ -3368,6 +3368,12 @@ NormalizeRowsInPlace(float* x, int64_t n, int64_t d) {
 //     scalar-quantized storage this re-quantizes the normalized vectors, which
 //     is not byte-identical to the legacy inverse-norm path (recall is gated in
 //     tests; a collection may need re-ingest for quantized cosine).
+//     int8 (QT_8bit_direct_signed) cosine is re-encoded as fp16, not int8:
+//     direct_signed is a fixed code=x+128 map, so normalized vectors (whose
+//     components shrink as ~1/sqrt(d)) would collapse onto a few of the 256
+//     levels. fp16 preserves normalized components accurately at any dimension
+//     and uses the validated fp16 GPU search path (2 B/dim for int8-cosine
+//     segments; a 1x-VRAM trained-QT_8bit int8-cosine path is a follow-up).
 static std::unique_ptr<faiss::IndexHNSW>
 ToVanillaHnsw(const faiss::cppcontrib::knowhere::IndexHNSW* src, bool is_cosine) {
     const int64_t d = src->d;
@@ -3390,7 +3396,20 @@ ToVanillaHnsw(const faiss::cppcontrib::knowhere::IndexHNSW* src, bool is_cosine)
         }
         const auto* src_sq = dynamic_cast<const faiss::IndexScalarQuantizer*>(src->storage);
         if (src_sq != nullptr) {
-            auto* out_sq = new faiss::IndexScalarQuantizer(static_cast<int>(d), src_sq->sq.qtype, out_metric);
+            // QT_8bit_direct_signed is a fixed code=x+128 map with no trained
+            // range: L2-normalized vectors live in [-1,1] and (worse) their
+            // components shrink as ~1/sqrt(d), so direct-signed encoding of
+            // normalized data collapses onto a handful of the 256 levels and
+            // destroys int8-cosine recall. Re-encode int8 cosine as fp16, which
+            // represents normalized components accurately at any dimension and
+            // reuses the validated fp16 GPU search path. int8 L2/IP are
+            // unaffected (they keep direct_signed + DP4A). A 1x-VRAM trained
+            // QT_8bit int8-cosine path is a follow-up; fp16 costs 2 B/dim here.
+            faiss::ScalarQuantizer::QuantizerType out_qtype = src_sq->sq.qtype;
+            if (out_qtype == faiss::ScalarQuantizer::QT_8bit_direct_signed) {
+                out_qtype = faiss::ScalarQuantizer::QT_fp16;
+            }
+            auto* out_sq = new faiss::IndexScalarQuantizer(static_cast<int>(d), out_qtype, out_metric);
             if (n > 0) {
                 out_sq->train(n, recons.data());
                 out_sq->add(n, recons.data());
@@ -3708,8 +3727,13 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         auto h_ids = std::make_unique<int64_t[]>(nq * k);
         auto h_dist = std::make_unique<float[]>(nq * k);
 
-        // Native int8 DP4A path: queries arrive as raw int8 (no MockWrapper upcast).
-        if (data_format == DataFormatEnum::int8) {
+        // Native int8 DP4A path: L2/IP queries arrive as raw int8 (no
+        // MockWrapper upcast) and match the direct_signed int8 DB via DP4A.
+        // int8 COSINE is deliberately excluded: its DB was re-encoded as fp16
+        // in ToVanillaHnsw() (direct_signed collapses normalized vectors), so
+        // it must go through the fp32/normalized searchHost() path below, not
+        // DP4A against fp16 codes.
+        if (data_format == DataFormatEnum::int8 && !is_cosine) {
             const auto* h_queries_i8 = reinterpret_cast<const int8_t*>(dataset->GetTensor());
             try {
                 faiss::gpu::GpuHnswSearchParams gsp;
@@ -3722,35 +3746,28 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
                                                  std::string("GPU HNSW int8 search failed: ") + e.what());
             }
 
-            // For COSINE, post-scale distances by 1/||q||. In the vanilla path
-            // the database vectors were L2-normalized before int8 re-encoding
-            // (no inverse-norm buffer is uploaded), so the kernel returns
-            // dot(q_i8, normalized_db_i8); dividing by the query norm finalizes
-            // the cosine similarity. Quantized-cosine numerics differ from the
-            // legacy inverse-norm path and are validated by the recall gate.
-            if (is_cosine) {
-                for (int64_t i = 0; i < static_cast<int64_t>(nq); i++) {
-                    const int8_t* q = h_queries_i8 + i * dim;
-                    int32_t sq_norm = 0;
-                    for (int64_t d = 0; d < static_cast<int64_t>(dim); d++) {
-                        sq_norm += static_cast<int32_t>(q[d]) * static_cast<int32_t>(q[d]);
-                    }
-                    float inv_qnorm = (sq_norm > 0) ? (1.0f / std::sqrt(static_cast<float>(sq_norm))) : 1.0f;
-                    for (int64_t j = 0; j < static_cast<int64_t>(k); j++) {
-                        h_dist[i * k + j] *= inv_qnorm;
-                    }
-                }
-            }
-
-            // No sign flip: faiss now returns the true similarity for IP/COSINE
+            // No sign flip: faiss now returns the true similarity for IP
             // (larger == closer), negating its internal min-first score on
             // copy-out. Previously the kernel returned the negated score and
             // this path flipped it back.
             return GenResultDataSet(nq, k, h_ids.release(), h_dist.release());
         }
 
-        // fp32 path (fp16/bf16 have already been upcast by MockWrapper).
-        const auto* h_queries_raw = reinterpret_cast<const float*>(dataset->GetTensor());
+        // fp32 path (fp16/bf16 have already been upcast by MockWrapper). int8
+        // COSINE also lands here: the raw int8 query is widened to fp32 so it
+        // can be normalized and searched against the fp16-re-encoded DB.
+        std::unique_ptr<float[]> int8_queries_f32;
+        const float* h_queries_raw;
+        if (data_format == DataFormatEnum::int8) {
+            const auto* h_queries_i8 = reinterpret_cast<const int8_t*>(dataset->GetTensor());
+            int8_queries_f32 = std::make_unique<float[]>(static_cast<size_t>(nq) * dim);
+            for (int64_t i = 0; i < static_cast<int64_t>(nq) * dim; i++) {
+                int8_queries_f32[i] = static_cast<float>(h_queries_i8[i]);
+            }
+            h_queries_raw = int8_queries_f32.get();
+        } else {
+            h_queries_raw = reinterpret_cast<const float*>(dataset->GetTensor());
+        }
 
         // For COSINE metric, normalize queries to unit length.
         const float* h_queries = h_queries_raw;
