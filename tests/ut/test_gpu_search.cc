@@ -2265,6 +2265,12 @@ TEST_CASE("GPU HNSW int8 cosine load host-RAM peak is bounded", "[gpu_hnsw_load_
     const size_t baseline = CurrentResidentBytes();
     REQUIRE(baseline > 0);
 
+    // Device free VRAM before the load (context + shared GpuResources already
+    // exist from the warm-up, and the warm index has been destroyed), so the
+    // free delta after Deserialize isolates this one segment's VRAM footprint.
+    size_t cuda_free_before = 0, cuda_total = 0;
+    REQUIRE(cudaMemGetInfo(&cuda_free_before, &cuda_total) == cudaSuccess);
+
     std::atomic<bool> sampling{true};
     std::atomic<size_t> peak_rss{baseline};
     std::thread sampler([&] {
@@ -2285,13 +2291,23 @@ TEST_CASE("GPU HNSW int8 cosine load host-RAM peak is bounded", "[gpu_hnsw_load_
     sampler.join();
     REQUIRE(st == knowhere::Status::success);
 
+    // Measure retained VRAM while gpu_idx is still alive (the upload has
+    // completed and the CPU copy is freed, so this is the steady-state device
+    // footprint the querynode GPU admission must reserve per segment).
+    size_t cuda_free_after = 0;
+    REQUIRE(cudaMemGetInfo(&cuda_free_after, &cuda_total) == cudaSuccess);
+    const size_t vram_delta = cuda_free_before > cuda_free_after ? cuda_free_before - cuda_free_after : 0;
+    const double vram_ratio = static_cast<double>(vram_delta) / static_cast<double>(file_size);
+
     const size_t peak = peak_rss.load();
     const size_t peak_delta = peak > baseline ? peak - baseline : 0;
     const double ratio = static_cast<double>(peak_delta) / static_cast<double>(file_size);
 
     std::ostringstream os;
     os << "[gpu_hnsw_load_mem] file_size=" << file_size << "B baseline=" << baseline << "B peak=" << peak
-       << "B peak_delta=" << peak_delta << "B ratio=" << ratio << "x (chunked expected ~3x, full-buffer ~5.5x)";
+       << "B peak_delta=" << peak_delta << "B ratio=" << ratio << "x (chunked expected ~3x, full-buffer ~5.5x)"
+       << " | VRAM: delta=" << vram_delta << "B vram_ratio=" << vram_ratio
+       << "x (per-segment device footprint for GPU admission sizing)";
     WARN(os.str());
 
     // Chunked reconstruct keeps the transient near (source + fp16 output + one
