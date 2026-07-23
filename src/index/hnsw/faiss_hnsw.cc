@@ -3389,39 +3389,74 @@ ToVanillaHnsw(const faiss::cppcontrib::knowhere::IndexHNSW* src, bool is_cosine)
 
     if (is_cosine) {
         // Reconstruct -> normalize -> re-encode into fresh vanilla storage.
-        std::vector<float> recons(static_cast<size_t>(n) * d);
-        if (n > 0) {
-            src->storage->reconstruct_n(0, n, recons.data());
-            NormalizeRowsInPlace(recons.data(), n, d);
-        }
+        //
+        // The reconstruct/normalize/add is streamed in bounded row chunks rather
+        // than materializing one n*d*4 fp32 buffer. For large int8-cosine
+        // segments that full buffer (e.g. ~17 GiB for a ~5 GB on-disk segment)
+        // dominated the host-RAM load peak and caused the querynode admission
+        // guard to under-reserve and OOM. Chunking caps the transient fp32
+        // staging to kReconChunkBytes while the re-encoded storage grows in
+        // place, so the peak is (src compact index + re-encoded storage + one
+        // chunk) instead of (src + full fp32 + re-encoded storage).
         const auto* src_sq = dynamic_cast<const faiss::IndexScalarQuantizer*>(src->storage);
+
+        // QT_8bit_direct_signed is a fixed code=x+128 map with no trained range:
+        // L2-normalized vectors live in [-1,1] and (worse) their components
+        // shrink as ~1/sqrt(d), so direct-signed encoding of normalized data
+        // collapses onto a handful of the 256 levels and destroys int8-cosine
+        // recall. Re-encode int8 cosine as fp16, which represents normalized
+        // components accurately at any dimension and reuses the validated fp16
+        // GPU search path. int8 L2/IP are unaffected (they keep direct_signed +
+        // DP4A). A 1x-VRAM trained QT_8bit int8-cosine path is a follow-up; fp16
+        // costs 2 B/dim here.
+        faiss::Index* out_storage = nullptr;
+        // Whether the output quantizer needs the full dataset to fit a range.
+        // fp16/bf16/direct(_signed) carry no trained parameters, so they can be
+        // streamed in chunks; the trained integer quantizers (QT_8bit/QT_4bit/
+        // QT_6bit) need the whole matrix and fall back to the full-buffer path.
+        // Those are not production int8-cosine paths.
+        bool needs_full_train = false;
         if (src_sq != nullptr) {
-            // QT_8bit_direct_signed is a fixed code=x+128 map with no trained
-            // range: L2-normalized vectors live in [-1,1] and (worse) their
-            // components shrink as ~1/sqrt(d), so direct-signed encoding of
-            // normalized data collapses onto a handful of the 256 levels and
-            // destroys int8-cosine recall. Re-encode int8 cosine as fp16, which
-            // represents normalized components accurately at any dimension and
-            // reuses the validated fp16 GPU search path. int8 L2/IP are
-            // unaffected (they keep direct_signed + DP4A). A 1x-VRAM trained
-            // QT_8bit int8-cosine path is a follow-up; fp16 costs 2 B/dim here.
             faiss::ScalarQuantizer::QuantizerType out_qtype = src_sq->sq.qtype;
             if (out_qtype == faiss::ScalarQuantizer::QT_8bit_direct_signed) {
                 out_qtype = faiss::ScalarQuantizer::QT_fp16;
             }
-            auto* out_sq = new faiss::IndexScalarQuantizer(static_cast<int>(d), out_qtype, out_metric);
-            if (n > 0) {
-                out_sq->train(n, recons.data());
-                out_sq->add(n, recons.data());
-            }
-            dst->storage = out_sq;
+            needs_full_train =
+                (out_qtype == faiss::ScalarQuantizer::QT_8bit || out_qtype == faiss::ScalarQuantizer::QT_4bit ||
+                 out_qtype == faiss::ScalarQuantizer::QT_6bit);
+            out_storage = new faiss::IndexScalarQuantizer(static_cast<int>(d), out_qtype, out_metric);
         } else {
-            auto* out_flat = new faiss::IndexFlat(static_cast<int>(d), out_metric);
-            if (n > 0) {
-                out_flat->add(n, recons.data());
-            }
-            dst->storage = out_flat;
+            out_storage = new faiss::IndexFlat(static_cast<int>(d), out_metric);
         }
+
+        if (n > 0) {
+            if (needs_full_train) {
+                std::vector<float> recons(static_cast<size_t>(n) * d);
+                src->storage->reconstruct_n(0, n, recons.data());
+                NormalizeRowsInPlace(recons.data(), n, d);
+                out_storage->train(n, recons.data());
+                out_storage->add(n, recons.data());
+            } else {
+                constexpr size_t kReconChunkBytes = static_cast<size_t>(256) << 20;
+                const int64_t chunk_rows = std::max<int64_t>(
+                    1, static_cast<int64_t>(kReconChunkBytes / (static_cast<size_t>(d) * sizeof(float))));
+                std::vector<float> buf(static_cast<size_t>(chunk_rows) * d);
+                bool trained = false;
+                for (int64_t start = 0; start < n; start += chunk_rows) {
+                    const int64_t cur = std::min<int64_t>(chunk_rows, n - start);
+                    src->storage->reconstruct_n(start, cur, buf.data());
+                    NormalizeRowsInPlace(buf.data(), cur, d);
+                    if (!trained) {
+                        // No-op for fp16/bf16/direct, but sets is_trained so add()
+                        // is legal; IndexFlat::train is a base no-op.
+                        out_storage->train(cur, buf.data());
+                        trained = true;
+                    }
+                    out_storage->add(cur, buf.data());
+                }
+            }
+        }
+        dst->storage = out_storage;
         dst->own_fields = true;
     } else {
         // Borrow the source storage (already a vanilla Flat/SQ subclass). The

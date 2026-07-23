@@ -9,12 +9,16 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
+#include <unistd.h>
+
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -2158,5 +2162,126 @@ TEST_CASE("GPU HNSW nq-chunking is result-invariant (visited-bitmap OOM fix)", "
         knowhere::BitsetView bitset(bd.data(), kDtypeNb, fc);
         check_chunk_parity<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, dtype_json(metric, ""), bitset);
     }
+}
+
+// Resident-set size (bytes) of this process, read from /proc/self/statm. Field 2
+// is the resident page count; multiply by the page size. Linux-only, which is
+// the CI/build platform for the GPU tests.
+static size_t
+CurrentResidentBytes() {
+    std::ifstream statm("/proc/self/statm");
+    size_t total_pages = 0;
+    size_t resident_pages = 0;
+    if (statm >> total_pages >> resident_pages) {
+        return resident_pages * static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    }
+    return 0;
+}
+
+// Regression guard for the int8-cosine GPU_HNSW load host-RAM peak (the OOM that
+// killed querynodes under concurrent segment loads).
+//
+// int8-cosine cannot use the native direct-signed device path: L2-normalized
+// components shrink as ~1/sqrt(d) and collapse onto a few of the 256 signed
+// levels, destroying recall. So ToVanillaHnsw() reconstructs the segment to
+// fp32, normalizes, and re-encodes to fp16 before the GPU upload. Done naively
+// that materializes one n*d*4 fp32 buffer on top of the source index and the
+// growing fp16 output, which is what blew past the load admission reservation
+// and OOM-killed the pod. ToVanillaHnsw() streams the reconstruct in bounded
+// row chunks so the transient fp32 staging is capped (~256 MiB) instead of the
+// whole matrix; the resident peak is then (source index + fp16 output + one
+// chunk) rather than (source + full fp32 + fp16 output).
+//
+// This measures actual resident-set growth during Deserialize() and asserts the
+// peak stays within a bound the chunked path meets but the old full-buffer path
+// does not. The CUDA context + shared GpuResources are warmed first so their
+// (large, fixed) footprint is part of the baseline and excluded from the delta.
+TEST_CASE("GPU HNSW int8 cosine load host-RAM peak is bounded", "[gpu_hnsw_load_mem]") {
+    const auto version = GenTestVersionList();
+    // nb*dim*4 must exceed the 256 MiB chunk so chunking actually engages and
+    // the full-buffer path would allocate a distinctly larger fp32 matrix.
+    const int64_t nb = 600000;
+    const int64_t dim = 384;
+    const int64_t seed = 42;
+
+    knowhere::Json build_json;
+    build_json[knowhere::meta::DIM] = dim;
+    build_json[knowhere::meta::METRIC_TYPE] = knowhere::metric::COSINE;
+    build_json[knowhere::meta::TOPK] = 1;
+    build_json[knowhere::indexparam::HNSW_M] = 16;
+    build_json[knowhere::indexparam::EFCONSTRUCTION] = 100;
+    build_json[knowhere::indexparam::EF] = 64;
+
+    // Warm the CUDA context + shared GpuResources with a tiny int8-cosine load so
+    // their resident footprint is established before we baseline.
+    {
+        auto warm_ds = knowhere::ConvertToDataTypeIfNeeded<knowhere::int8>(GenDataSet(2000, dim, seed + 9));
+        auto warm_cpu =
+            knowhere::IndexFactory::Instance().Create<knowhere::int8>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        REQUIRE(warm_cpu.Build(warm_ds, build_json) == knowhere::Status::success);
+        knowhere::BinarySet warm_bs;
+        warm_cpu.Serialize(warm_bs);
+        auto warm_gpu = knowhere::IndexFactory::Instance()
+                            .Create<knowhere::int8>(knowhere::IndexEnum::INDEX_GPU_HNSW, version)
+                            .value();
+        REQUIRE(warm_gpu.Deserialize(warm_bs) == knowhere::Status::success);
+    }
+
+    // Build the CPU int8-cosine HNSW, serialize, and drop the CPU index + the
+    // training dataset so the baseline holds only the serialized bytes.
+    knowhere::BinarySet bs;
+    {
+        auto train_ds = knowhere::ConvertToDataTypeIfNeeded<knowhere::int8>(GenDataSet(nb, dim, seed));
+        auto cpu_idx =
+            knowhere::IndexFactory::Instance().Create<knowhere::int8>(knowhere::IndexEnum::INDEX_HNSW, version).value();
+        REQUIRE(cpu_idx.Build(train_ds, build_json) == knowhere::Status::success);
+        cpu_idx.Serialize(bs);
+    }
+
+    uint64_t file_size = 0;
+    for (const auto& kv : bs.binary_map_) {
+        file_size += kv.second->size;
+    }
+    REQUIRE(file_size > 0);
+
+    // Let deallocations settle, then baseline.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const size_t baseline = CurrentResidentBytes();
+    REQUIRE(baseline > 0);
+
+    std::atomic<bool> sampling{true};
+    std::atomic<size_t> peak_rss{baseline};
+    std::thread sampler([&] {
+        while (sampling.load(std::memory_order_relaxed)) {
+            const size_t r = CurrentResidentBytes();
+            size_t prev = peak_rss.load(std::memory_order_relaxed);
+            while (r > prev && !peak_rss.compare_exchange_weak(prev, r)) {
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(300));
+        }
+    });
+
+    auto gpu_idx =
+        knowhere::IndexFactory::Instance().Create<knowhere::int8>(knowhere::IndexEnum::INDEX_GPU_HNSW, version).value();
+    const auto st = gpu_idx.Deserialize(bs);
+
+    sampling.store(false, std::memory_order_relaxed);
+    sampler.join();
+    REQUIRE(st == knowhere::Status::success);
+
+    const size_t peak = peak_rss.load();
+    const size_t peak_delta = peak > baseline ? peak - baseline : 0;
+    const double ratio = static_cast<double>(peak_delta) / static_cast<double>(file_size);
+
+    std::ostringstream os;
+    os << "[gpu_hnsw_load_mem] file_size=" << file_size << "B baseline=" << baseline << "B peak=" << peak
+       << "B peak_delta=" << peak_delta << "B ratio=" << ratio << "x (chunked expected ~3x, full-buffer ~5.5x)";
+    WARN(os.str());
+
+    // Chunked reconstruct keeps the transient near (source + fp16 output + one
+    // 256 MiB chunk). The old full-buffer path adds a whole n*d*4 fp32 matrix on
+    // top, pushing the ratio well past this bound. 4.3x leaves margin for CUDA
+    // pinned staging / allocator slack while still failing the full-buffer path.
+    CHECK(ratio < 4.3);
 }
 #endif
