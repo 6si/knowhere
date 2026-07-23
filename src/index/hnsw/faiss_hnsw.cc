@@ -3534,26 +3534,45 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
         // incur. Basing the estimate on file_size also avoids relying on
         // num_rows/dim, which can arrive as 0 at estimate time.
         //
-        // KNOWN LIMITATION: this 2x is correct for the native int8/fp16/bf16
-        // and int8-SQ upload paths (no fp32 staging). It UNDER-counts the two
-        // paths that materialize a full fp32 buffer during load — VECTOR_FLOAT
-        // IndexHNSWFlat (from_faiss_hnsw_flat does a reconstruct_n into a
-        // host float[]) and unsigned QT_8bit SQ8 (sa_decode into float) — whose
-        // true transient peak is closer to file_size + rows*dim*4. It is not
-        // corrected here because this static entry point receives no data-type
-        // discriminator (the same non-templated StaticEstimateLoadResource is
-        // registered for fp32/fp16/bf16/int8), so adding a blanket rows*dim*4
-        // term would badly over-reserve host RAM on the compact int8 path that
-        // production actually uses. Fixing it properly needs a per-DataType
-        // estimator; tracked as a follow-up.
+        // COSINE is the exception. int8-cosine (and any cosine) cannot upload
+        // directly: normalized signed-int8 codes collapse onto a few levels, so
+        // ToVanillaHnsw() reconstructs the segment, normalizes, and re-encodes
+        // to fp16 before the upload (see the cosine branch there). Even with the
+        // chunked reconstruct, the host transient then holds, concurrently:
+        //   serialized read buffer (~1x file) + deserialized compact index
+        //   (~1x file) + fp16 re-encoded storage (~2x the int8 codes, i.e. up to
+        //   ~2x file) + one bounded reconstruct chunk (256 MiB).
+        // The [gpu_hnsw_load_mem] unit test measures ~3.9x file above a baseline
+        // that already holds the read buffer, i.e. ~4x file + one chunk from the
+        // pre-load state. Charging only 2x here is what under-reserved the
+        // querynode load admission and let concurrent cosine loads OOM the pod.
+        // So the cosine path reserves 4x file + a fixed slack (chunk + CUDA/
+        // allocator overhead). Native L2/IP int8/fp16/bf16 keep 2x (direct
+        // upload, no fp32/fp16 re-encode).
+        //
+        // KNOWN LIMITATION: 2x still UNDER-counts two non-cosine fp32-staging
+        // paths — VECTOR_FLOAT IndexHNSWFlat (reconstruct_n into a host float[])
+        // and unsigned QT_8bit SQ8 (sa_decode into float) — whose true peak is
+        // closer to file_size + rows*dim*4. Not corrected here because this
+        // static entry point has no data-type discriminator (one
+        // StaticEstimateLoadResource is registered for fp32/fp16/bf16/int8);
+        // production GPU HNSW does not use those paths. Tracked as a follow-up.
         (void)num_rows;
         (void)dim;
-        (void)config;
         (void)version;
 
-        const uint64_t peak = file_size_in_bytes * 2;
+        // Fixed slack covering the bounded reconstruct chunk plus CUDA/allocator
+        // overhead that does not scale with file_size.
+        constexpr uint64_t kLoadFixedOverheadBytes = static_cast<uint64_t>(512) << 20;
 
-        LOG_KNOWHERE_INFO_ << "GPU_HNSW load estimate (compact int8): file_size=" << file_size_in_bytes
+        bool is_cosine = true;  // conservative default when metric is absent
+        if (config.metric_type.has_value()) {
+            is_cosine = IsMetricType(config.metric_type.value(), knowhere::metric::COSINE);
+        }
+
+        const uint64_t peak = is_cosine ? (file_size_in_bytes * 4 + kLoadFixedOverheadBytes) : (file_size_in_bytes * 2);
+
+        LOG_KNOWHERE_INFO_ << "GPU_HNSW load estimate: file_size=" << file_size_in_bytes << " is_cosine=" << is_cosine
                            << " transient_peak=" << peak << " retained=0";
 
         return Resource{.memoryCost = 0, .diskCost = 0, .maxMemoryCost = peak};

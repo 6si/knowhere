@@ -1474,6 +1474,22 @@ TEST_CASE("Test GPU HNSW Codex P1 Regressions", "[gpu_hnsw_p1]") {
         REQUIRE(norows_res.has_value());
         REQUIRE(norows_res.value().maxMemoryCost >= 2 * int8_file);
 
+        // COSINE reserves more: it reconstructs + re-encodes to fp16 before the
+        // upload, so the transient peak is ~4x file + fixed slack, not 2x. The
+        // [gpu_hnsw_load_mem] test measures the real ~3.9x runtime peak; the
+        // estimate must stay at or above it to keep concurrent loads from
+        // over-admitting and OOM-killing the pod.
+        knowhere::Json cos_params;
+        cos_params[knowhere::meta::METRIC_TYPE] = knowhere::metric::COSINE;
+        cos_params[knowhere::meta::DIM] = dim;
+        auto cos_res = knowhere::IndexStaticFaced<knowhere::fp32>::EstimateLoadResource(
+            knowhere::IndexEnum::INDEX_GPU_HNSW, version, int8_file, nb, dim, cos_params);
+        REQUIRE(cos_res.has_value());
+        REQUIRE(cos_res.value().memoryCost == 0);
+        REQUIRE(cos_res.value().maxMemoryCost >= 4 * int8_file);
+        // And strictly larger than the native (L2) direct-upload estimate.
+        REQUIRE(cos_res.value().maxMemoryCost > compressed_res.value().maxMemoryCost);
+
         // A plain CPU HNSW keeps its data resident: memoryCost is non-zero and it
         // does not opt into the peak field (maxMemoryCost stays 0 -> Milvus falls
         // back to its 2*memoryCost heuristic).
