@@ -1490,6 +1490,13 @@ TEST_CASE("Test GPU HNSW Codex P1 Regressions", "[gpu_hnsw_p1]") {
         // And strictly larger than the native (L2) direct-upload estimate.
         REQUIRE(cos_res.value().maxMemoryCost > compressed_res.value().maxMemoryCost);
 
+        // The device (VRAM) reservation is reported separately and is decoupled
+        // from the host transient peak: it must be > 0 and, for cosine, well
+        // below the (larger) host peak so GPU admission does not over-reserve.
+        REQUIRE(cos_res.value().gpuMemoryCost >= 2 * int8_file);
+        REQUIRE(cos_res.value().gpuMemoryCost < cos_res.value().maxMemoryCost);
+        REQUIRE(compressed_res.value().gpuMemoryCost >= 2 * int8_file);
+
         // A plain CPU HNSW keeps its data resident: memoryCost is non-zero and it
         // does not opt into the peak field (maxMemoryCost stays 0 -> Milvus falls
         // back to its 2*memoryCost heuristic).
@@ -2315,5 +2322,11 @@ TEST_CASE("GPU HNSW int8 cosine load host-RAM peak is bounded", "[gpu_hnsw_load_
     // top, pushing the ratio well past this bound. 4.3x leaves margin for CUDA
     // pinned staging / allocator slack while still failing the full-buffer path.
     CHECK(ratio < 4.3);
+
+    // The measured per-segment device footprint must stay under the 2x file
+    // GPU reservation that StaticEstimateLoadResource reports (gpuMemoryCost),
+    // so querynode GPU admission does not under-reserve VRAM. int8-cosine
+    // measures ~1.7x (fp16 on device); the 2x reservation leaves headroom.
+    CHECK(vram_ratio < 2.0);
 }
 #endif

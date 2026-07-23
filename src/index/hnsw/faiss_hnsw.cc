@@ -3572,10 +3572,18 @@ class GpuHnswIndexNode : public BaseFaissRegularIndexHNSWNode {
 
         const uint64_t peak = is_cosine ? (file_size_in_bytes * 4 + kLoadFixedOverheadBytes) : (file_size_in_bytes * 2);
 
-        LOG_KNOWHERE_INFO_ << "GPU_HNSW load estimate: file_size=" << file_size_in_bytes << " is_cosine=" << is_cosine
-                           << " transient_peak=" << peak << " retained=0";
+        // Device (VRAM) footprint retained after upload, independent of the host
+        // transient peak above. The [gpu_hnsw_load_mem] test measures ~1.7x file
+        // for int8-cosine (vectors re-encoded to fp16 on the device); fp16/bf16
+        // native storage is ~2x the codes and int8/L2 native ~1x. 2x file covers
+        // all of these with margin. Reported separately so querynode GPU
+        // admission reserves the real VRAM growth rather than the host peak.
+        const uint64_t gpu_peak = file_size_in_bytes * 2;
 
-        return Resource{.memoryCost = 0, .diskCost = 0, .maxMemoryCost = peak};
+        LOG_KNOWHERE_INFO_ << "GPU_HNSW load estimate: file_size=" << file_size_in_bytes << " is_cosine=" << is_cosine
+                           << " transient_peak=" << peak << " gpu_peak=" << gpu_peak << " retained=0";
+
+        return Resource{.memoryCost = 0, .diskCost = 0, .maxMemoryCost = peak, .gpuMemoryCost = gpu_peak};
     }
 
     std::unique_ptr<BaseConfig>
