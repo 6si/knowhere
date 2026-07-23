@@ -11,9 +11,11 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -39,6 +41,35 @@
 // Host-safe header (no device kernels) exposing GpuHnswUploadFaultInjection, the
 // test-only hook used by the CUDA-upload fault-injection section below.
 #include <faiss/gpu/impl/GpuHnswTypes.h>
+
+inline knowhere::DataSetPtr
+GenNormalizedInt8DataSet(int rows, int dim, int seed = 42) {
+    auto* tensor = new knowhere::int8[rows * dim];
+    std::vector<float> row(dim);
+    for (int i = 0; i < rows; ++i) {
+        double norm = 0.0;
+        for (int j = 0; j < dim; ++j) {
+            row[j] = std::sin(float((i + seed + 1) * (j + 3))) + std::cos(float((i + seed + 5) * (j + 1)));
+            norm += double(row[j]) * row[j];
+        }
+        norm = std::sqrt(norm);
+
+        auto nonzero = false;
+        for (int j = 0; j < dim; ++j) {
+            auto scaled = norm == 0.0 ? 0 : int(std::llround(double(row[j]) / norm * 127.0));
+            scaled = std::max(-127, std::min(127, scaled));
+            tensor[i * dim + j] = knowhere::int8(scaled);
+            nonzero = nonzero || scaled != 0;
+        }
+        if (!nonzero) {
+            tensor[i * dim] = knowhere::int8(127);
+        }
+    }
+
+    auto ds = knowhere::GenDataSet(rows, dim, tensor);
+    ds->SetIsOwner(true);
+    return ds;
+}
 
 template <typename T>
 void
@@ -430,6 +461,46 @@ TEST_CASE("Test All GPU Index", "[search]") {
         auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, json, nullptr);
         float recall = GetKNNRecall(*gt.value(), *results.value());
         REQUIRE(recall > 0.65f);
+    }
+
+    SECTION("Test Gpu Cagra Int8 Cosine Score Range") {
+        constexpr auto rows = 512;
+        constexpr auto query_rows = 64;
+        constexpr auto test_dim = 64;
+        constexpr auto topk = 10;
+
+        knowhere::Json json;
+        json[knowhere::meta::DIM] = test_dim;
+        json[knowhere::meta::METRIC_TYPE] = knowhere::metric::COSINE;
+        json[knowhere::meta::TOPK] = topk;
+        json[knowhere::indexparam::INTERMEDIATE_GRAPH_DEGREE] = 64;
+        json[knowhere::indexparam::GRAPH_DEGREE] = 32;
+        json[knowhere::indexparam::ITOPK_SIZE] = 64;
+        json[knowhere::indexparam::NUM_RANDOM_SAMPLINGS] = 4;
+
+        auto idx = knowhere::IndexFactory::Instance()
+                       .Create<knowhere::int8>(knowhere::IndexEnum::INDEX_CUVS_CAGRA, version)
+                       .value();
+        auto train_ds = GenNormalizedInt8DataSet(rows, test_dim, seed);
+        auto query_ds = GenNormalizedInt8DataSet(query_rows, test_dim, seed);
+
+        auto res = idx.Build(train_ds, json);
+        REQUIRE(res == knowhere::Status::success);
+        auto results = idx.Search(query_ds, json, nullptr);
+        REQUIRE(results.has_value());
+
+        auto ids = results.value()->GetIds();
+        auto distances = results.value()->GetDistance();
+        auto max_distance = -1.0f;
+        for (auto i = 0; i < query_rows * topk; ++i) {
+            if (ids[i] < 0) {
+                continue;
+            }
+            max_distance = std::max(max_distance, distances[i]);
+            CHECK(distances[i] >= -1.00001f);
+            CHECK(distances[i] <= 1.00001f);
+        }
+        CHECK(max_distance > 0.5f);
     }
 
     SECTION("Test Gpu Index Search Hamming Metric") {
