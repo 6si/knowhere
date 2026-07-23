@@ -623,6 +623,14 @@ if(WITH_CUVS)
     thirdparty/faiss/faiss/gpu/utils/Timer.cpp
   )
   add_library(faiss_gpu_hnsw OBJECT ${FAISS_GPU_HNSW_SRCS})
+  # These objects are linked into the STATIC `faiss` target which is in turn
+  # linked into the shared libknowhere.so. The global -fPIC in
+  # cmake/utils/compile_flags.cmake only reaches the C++ host compiler, not the
+  # CUDA (.cu) sources built by nvcc, so their objects are non-PIC and trigger
+  # `relocation R_X86_64_PC32 ... can not be used when making a shared object`
+  # (surfaces in clean/Debug test builds). Mirror upstream faiss_gpu_objs and
+  # mark the target PIC so CMake passes -Xcompiler -fPIC to nvcc.
+  set_target_properties(faiss_gpu_hnsw PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(faiss_gpu_hnsw PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/faiss
     ${Boost_INCLUDE_DIRS}
